@@ -56,7 +56,7 @@ class OffroadTimerControlSP(OptionControlSP):
 
   def _write_param(self, value):
     cfg = _read_offroad_cfg()
-    cfg["timer"] = value
+    cfg["timer"] = self.value_map[value] if self.value_map else value
     _write_offroad_cfg(cfg)
 
 

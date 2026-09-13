@@ -349,12 +349,10 @@ class Device(DeviceSP):
         import json
         cfg = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-      return
-    timer_idx = cfg.get("timer", 0)
-    if timer_idx == 0:
-      return
-    from openpilot.sunnypilot.system.params_migration import ONROAD_BRIGHTNESS_TIMER_VALUES
-    secs = ONROAD_BRIGHTNESS_TIMER_VALUES.get(timer_idx, 3)
+      cfg = {}
+    seconds = cfg.get("timer", 3)
+    if seconds > 0:
+      self._offroad_brightness_timer = seconds * gui_app.target_fps
     self._offroad_brightness_timer = secs * gui_app.target_fps
 
   def _update_wakefulness(self):
