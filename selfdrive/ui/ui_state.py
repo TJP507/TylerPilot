@@ -353,7 +353,6 @@ class Device(DeviceSP):
     seconds = cfg.get("timer", 3)
     if seconds > 0:
       self._offroad_brightness_timer = seconds * gui_app.target_fps
-    self._offroad_brightness_timer = secs * gui_app.target_fps
 
   def _update_wakefulness(self):
     # Handle interactive timeout
