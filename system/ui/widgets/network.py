@@ -113,8 +113,8 @@ class NetworkUI(Widget):
       self._cellular_btn.set_rect(rl.Rectangle(x + btn_w + gap, y, btn_w, btn_h))
       self._cellular_btn.render()
     elif self._current_panel == PanelType.WIFI:
-      content_rect = rl.Rectangle(self._rect.x, self._rect.y + self._back_btn.rect.height + 20,
-                                  self._rect.width, self._rect.height - self._back_btn.rect.height - 20)
+      content_rect = rl.Rectangle(self._rect.x, self._rect.y + 20,
+                                  self._rect.width, self._rect.height - 20)
       self._back_btn.set_position(self._rect.x, self._rect.y + 20)
       self._back_btn.render()
       self._wifi_panel.render(content_rect)
