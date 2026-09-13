@@ -309,7 +309,6 @@ class Device(DeviceSP):
 
     if gui_app.sunnypilot_ui():
       brightness = DeviceSP.set_onroad_brightness(ui_state, self._awake, brightness)
-      brightness = DeviceSP.set_offroad_brightness(ui_state, self._awake, brightness)
 
     if not self._awake:
       brightness = 0
@@ -327,12 +326,8 @@ class Device(DeviceSP):
     if ignition_just_turned_off or any(ev.left_down for ev in gui_app.mouse_events):
       if gui_app.sunnypilot_ui():
         DeviceSP.wake_from_dimmed_onroad_brightness(ui_state, gui_app.mouse_events)
-        if not ui_state.started:
-          ui_state.reset_offroad_sleep_timer()
 
       self._reset_interactive_timeout()
-    elif gui_app.sunnypilot_ui() and not ui_state.started:
-      ui_state.update_offroad_brightness(False)
 
     interaction_timeout = time.monotonic() > self._interaction_time
     if interaction_timeout and not self._prev_timed_out:

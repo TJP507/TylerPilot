@@ -46,9 +46,6 @@ class UIStateSP:
     self.onroad_brightness: int = 0
     self.onroad_brightness_timer: int = 0
     self.onroad_brightness_timer_param: int = 0
-    self.offroad_brightness: int = 0
-    self.offroad_brightness_timer: int = 0
-    self.offroad_brightness_timer_param: int = 0
     self.rainbow_path: bool = False
     self.road_name_toggle: bool = False
     self.rocket_fuel: bool = False
@@ -104,20 +101,6 @@ class UIStateSP:
   def auto_onroad_brightness(self) -> bool:
     return self.onroad_brightness in (OnroadBrightness.AUTO, OnroadBrightness.AUTO_DARK)
 
-  def update_offroad_brightness(self, has_activity: bool) -> None:
-    if has_activity:
-      return
-    if self.offroad_brightness_timer > 0:
-      self.offroad_brightness_timer -= 1
-
-  def reset_offroad_sleep_timer(self) -> None:
-    if self.offroad_brightness != OnroadBrightness.AUTO and self.offroad_brightness_timer_param >= 0:
-      self.offroad_brightness_timer = self.offroad_brightness_timer_param * gui_app.target_fps
-
-  @property
-  def offroad_brightness_timer_expired(self) -> bool:
-    return self.offroad_brightness != OnroadBrightness.AUTO and self.offroad_brightness_timer == 0
-
   @staticmethod
   def update_status(ss, ss_sp, onroad_evt) -> str:
     state = ss.state
@@ -170,8 +153,6 @@ class UIStateSP:
     self.hide_v_ego_ui = self.params.get_bool("HideVEgoUI")
     self.onroad_brightness = int(float(self.params.get("OnroadScreenOffBrightness", return_default=True)))
     self.onroad_brightness_timer_param = self.params.get("OnroadScreenOffTimer", return_default=True)
-    self.offroad_brightness = int(float(self.params.get("OffroadScreenOffBrightness", return_default=True)))
-    self.offroad_brightness_timer_param = self.params.get("OffroadScreenOffTimer", return_default=True)
     self.rainbow_path = self.params.get_bool("RainbowMode")
     self.road_name_toggle = self.params.get_bool("RoadNameToggle")
     self.rocket_fuel = self.params.get_bool("RocketFuel")
@@ -268,21 +249,6 @@ class DeviceSP:
 
     # 3-22: 5% - 100%
     return float((_ui_state.onroad_brightness - 2) * 5)
-
-  @staticmethod
-  def set_offroad_brightness(_ui_state, awake: bool, cur_brightness: float) -> float:
-    if not awake or _ui_state.started:
-      return cur_brightness
-
-    if _ui_state.offroad_brightness_timer != 0:
-      return cur_brightness
-
-    if _ui_state.offroad_brightness == OnroadBrightness.AUTO:
-      return cur_brightness
-    if _ui_state.offroad_brightness == OnroadBrightness.SCREEN_OFF:
-      return 0.0
-
-    return float((_ui_state.offroad_brightness - 2) * 5)
 
   @staticmethod
   def set_min_onroad_brightness(_ui_state, min_brightness: int) -> int:
