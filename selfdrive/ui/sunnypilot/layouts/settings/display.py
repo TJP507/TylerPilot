@@ -10,7 +10,7 @@ from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.sunnypilot.widgets.list_view import option_item_sp
-from openpilot.sunnypilot.system.params_migration import ONROAD_BRIGHTNESS_TIMER_VALUES
+from openpilot.sunnypilot.system.params_migration import ONROAD_BRIGHTNESS_TIMER_VALUES, OFFROAD_BRIGHTNESS_TIMER_VALUES
 
 
 class OnroadBrightness(IntEnum):
@@ -61,9 +61,32 @@ class DisplayLayout(Widget):
                                     f"{value} s" if value < 60 else f"{int(value/60)} m"),
       inline=True
     )
+    self._offroad_brightness = option_item_sp(
+      param="OffroadScreenOffBrightness",
+      title=lambda: tr("Offroad Brightness"),
+      description="",
+      min_value=0,
+      max_value=22,
+      value_change_step=1,
+      label_callback=lambda value: self.update_offroad_brightness(value),
+      inline=True
+    )
+    self._offroad_brightness_timer = option_item_sp(
+      param="OffroadScreenOffTimer",
+      title=lambda: tr("Offroad Brightness Delay"),
+      description="",
+      min_value=0,
+      max_value=15,
+      value_change_step=1,
+      value_map=OFFROAD_BRIGHTNESS_TIMER_VALUES,
+      label_callback=lambda value: f"{value} s" if value < 60 else f"{int(value/60)} m",
+      inline=True
+    )
     items = [
       self._onroad_brightness,
       self._onroad_brightness_timer,
+      self._offroad_brightness,
+      self._offroad_brightness_timer,
       self._interactivity_timeout,
     ]
     return items
@@ -81,11 +104,24 @@ class DisplayLayout(Widget):
 
     return f"{(val - 2) * 5} %"
 
+  @staticmethod
+  def update_offroad_brightness(val):
+    if val == OnroadBrightness.AUTO:
+      return tr("Default")
+
+    if val == OnroadBrightness.SCREEN_OFF:
+      return tr("Screen Off")
+
+    return f"{(val - 2) * 5} %"
+
   def _update_state(self):
     super()._update_state()
 
     brightness_val = self._onroad_brightness.action_item.current_value
     self._onroad_brightness_timer.action_item.set_enabled(brightness_val not in (OnroadBrightness.AUTO, OnroadBrightness.AUTO_DARK))
+
+    offroad_val = self._offroad_brightness.action_item.current_value
+    self._offroad_brightness_timer.action_item.set_enabled(offroad_val not in (OnroadBrightness.AUTO, OnroadBrightness.AUTO_DARK))
 
   def _render(self, rect):
     self._scroller.render(rect)
