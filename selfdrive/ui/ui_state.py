@@ -330,16 +330,15 @@ class Device(DeviceSP):
     except (FileNotFoundError, json.JSONDecodeError):
       return cur_brightness
 
+    if self._offroad_brightness_timer > 0:
+      return cur_brightness
+
     val = cfg.get("brightness", 0)
-    timer_idx = cfg.get("timer", 0)
 
     if val == 0:
       return cur_brightness
     if val == 2:
       return 0.0
-
-    if self._offroad_brightness_timer > 0:
-      return cur_brightness
 
     return float((val - 2) * 5)
 
