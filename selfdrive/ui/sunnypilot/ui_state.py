@@ -173,7 +173,6 @@ class UIStateSP:
     if not self._sp_initialized:
       self._sp_initialized = True
       self.reset_onroad_sleep_timer()
-      self.reset_offroad_sleep_timer()
 
   def _enforce_constraints(self) -> None:
     has_long = self.has_longitudinal_control
