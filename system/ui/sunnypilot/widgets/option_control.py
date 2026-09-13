@@ -40,6 +40,13 @@ class OptionControlSP(ItemAction):
     self.label_callback = label_callback
     self._load_value()
 
+    # Initialize font and button styles
+    self._font = gui_app.font(FontWeight.MEDIUM)
+
+    # Layout rectangles for components
+    self.minus_btn_rect = rl.Rectangle(0, 0, 0, 0)
+    self.plus_btn_rect = rl.Rectangle(0, 0, 0, 0)
+
   def _load_value(self):
     if self.value_map:
       for key in self.value_map:
@@ -60,13 +67,6 @@ class OptionControlSP(ItemAction):
       self.params.put(self.param_key, value / 100.0)
     else:
       self.params.put(self.param_key, value)
-
-    # Initialize font and button styles
-    self._font = gui_app.font(FontWeight.MEDIUM)
-
-    # Layout rectangles for components
-    self.minus_btn_rect = rl.Rectangle(0, 0, 0, 0)
-    self.plus_btn_rect = rl.Rectangle(0, 0, 0, 0)
 
   def get_value(self) -> int:
     """Get the current value of the control"""
