@@ -38,14 +38,28 @@ class OptionControlSP(ItemAction):
     self.use_float_scaling = use_float_scaling
     self.current_value = min_value
     self.label_callback = label_callback
+    self._load_value()
+
+  def _load_value(self):
     if self.value_map:
       for key in self.value_map:
-        if self.value_map[key] == self.params.get(self.param_key, return_default=True):
+        if self.value_map[key] == self._read_param():
           self.current_value = int(key)
           break
     else:
-      value = self.params.get(self.param_key, return_default=True)
+      value = self._read_param()
       self.current_value = int(float(value) * 100.0) if self.use_float_scaling else int(value)
+
+  def _read_param(self):
+    return self.params.get(self.param_key, return_default=True)
+
+  def _write_param(self, value):
+    if self.value_map:
+      self.params.put(self.param_key, self.value_map[value])
+    elif self.use_float_scaling:
+      self.params.put(self.param_key, value / 100.0)
+    else:
+      self.params.put(self.param_key, value)
 
     # Initialize font and button styles
     self._font = gui_app.font(FontWeight.MEDIUM)
@@ -65,12 +79,7 @@ class OptionControlSP(ItemAction):
     if value == self.current_value:
       return
     self.current_value = value
-    if self.value_map:
-      self.params.put(self.param_key, self.value_map[value])
-    elif self.use_float_scaling:
-      self.params.put(self.param_key, value / 100.0)
-    else:
-      self.params.put(self.param_key, value)
+    self._write_param(value)
     if self.on_value_changed:
       self.on_value_changed(value)
 
