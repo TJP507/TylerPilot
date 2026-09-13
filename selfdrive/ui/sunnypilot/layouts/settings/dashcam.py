@@ -235,6 +235,7 @@ class _Decoder(threading.Thread):
         pass
 
       emitted = 0
+      seeking = seek is not None
       for frame in container.decode(stream):
         if self._stop_ev.is_set():
           container.close()
@@ -244,12 +245,14 @@ class _Decoder(threading.Thread):
           continue
         if self._has_pending_seek():
           break
-        self._wait_if_paused()
-        if self._stop_ev.is_set():
-          container.close()
-          return
+        if not seeking:
+          self._wait_if_paused()
+          if self._stop_ev.is_set():
+            container.close()
+            return
         self._publish(frame, frame_base + emitted)
         emitted += 1
+        seeking = False
       container.close()
 
       if self._has_pending_seek():
@@ -279,18 +282,21 @@ class _Decoder(threading.Thread):
         except Exception:
           pass
 
+      seeking = seek is not None
       for frame in container.decode(stream):
         if self._stop_ev.is_set():
           container.close()
           return
         if self._has_pending_seek():
           break
-        self._wait_if_paused()
-        if self._stop_ev.is_set():
-          container.close()
-          return
+        if not seeking:
+          self._wait_if_paused()
+          if self._stop_ev.is_set():
+            container.close()
+            return
         t = frame.time if frame.time is not None else 0.0
         self._publish(frame, int(t * fps))
+        seeking = False
 
       if self._has_pending_seek():
         continue
