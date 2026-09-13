@@ -1,6 +1,8 @@
+import json
+import time
 from enum import IntEnum
 from functools import partial
-from typing import cast
+from typing import Any, cast
 
 import pyray as rl
 from openpilot.system.ui.lib.application import gui_app
@@ -27,9 +29,9 @@ try:
   from openpilot.selfdrive.ui.ui_state import ui_state
   from openpilot.selfdrive.ui.lib.prime_state import PrimeType
 except Exception:
-  Params = None
-  ui_state = None
-  PrimeType = None
+  Params: Any = None
+  ui_state: Any = None
+  PrimeType: Any = None
 
 NM_DEVICE_STATE_NEED_AUTH = 60
 MIN_PASSWORD_LENGTH = 8
@@ -46,8 +48,9 @@ STRENGTH_ICONS = [
 
 
 class PanelType(IntEnum):
-  WIFI = 0
-  ADVANCED = 1
+  SELECT = 0
+  WIFI = 1
+  CELLULAR = 2
 
 
 class UIState(IntEnum):
@@ -74,57 +77,112 @@ class NetworkUI(Widget):
   def __init__(self, wifi_manager: WifiManager):
     super().__init__()
     self._wifi_manager = wifi_manager
-    self._current_panel: PanelType = PanelType.WIFI
-    self._wifi_panel = self._child(WifiManagerUI(wifi_manager))
-    self._advanced_panel = self._child(AdvancedNetworkSettings(wifi_manager))
-    self._nav_button = self._child(NavButton(tr("Advanced")))
-    self._nav_button.set_click_callback(self._cycle_panel)
+    self._current_panel: PanelType = PanelType.SELECT
+
+    self._wifi_panel = self._child(WifiPanel(wifi_manager))
+    self._cellular_panel = self._child(CellularSettings(wifi_manager))
+
+    self._wifi_btn = self._child(NavButton(tr("Wi-Fi")))
+    self._wifi_btn.set_click_callback(lambda: self._set_panel(PanelType.WIFI))
+    self._cellular_btn = self._child(NavButton(tr("Cellular")))
+    self._cellular_btn.set_click_callback(lambda: self._set_panel(PanelType.CELLULAR))
+
+    self._back_btn = self._child(NavButton(tr("Back")))
+    self._back_btn.set_click_callback(self._go_back)
 
   def show_event(self):
     super().show_event()
-    self._set_current_panel(PanelType.WIFI)
+    self._set_panel(PanelType.SELECT)
 
-  def _cycle_panel(self):
-    if self._current_panel == PanelType.WIFI:
-      self._set_current_panel(PanelType.ADVANCED)
-    else:
-      self._set_current_panel(PanelType.WIFI)
+  def _go_back(self):
+    self._set_panel(PanelType.SELECT)
 
-  def _render(self, _):
-    # subtract button
-    content_rect = rl.Rectangle(self._rect.x, self._rect.y + self._nav_button.rect.height + 40,
-                                self._rect.width, self._rect.height - self._nav_button.rect.height - 40)
-    if self._current_panel == PanelType.WIFI:
-      self._nav_button.text = tr("Advanced")
-      self._nav_button.set_position(self._rect.x + self._rect.width - self._nav_button.rect.width, self._rect.y + 20)
-      self._wifi_panel.render(content_rect)
-    else:
-      self._nav_button.text = tr("Back")
-      self._nav_button.set_position(self._rect.x, self._rect.y + 20)
-      self._advanced_panel.render(content_rect)
-
-    self._nav_button.render()
-
-  def _set_current_panel(self, panel: PanelType):
+  def _set_panel(self, panel: PanelType):
     self._current_panel = panel
 
+  def _render(self, _):
+    if self._current_panel == PanelType.SELECT:
+      btn_w, btn_h = 350, 120
+      gap = 40
+      total_w = btn_w * 2 + gap
+      x = self._rect.x + (self._rect.width - total_w) / 2
+      y = self._rect.y + (self._rect.height - btn_h) / 2
 
-class AdvancedNetworkSettings(Widget):
+      self._wifi_btn.set_rect(rl.Rectangle(x, y, btn_w, btn_h))
+      self._wifi_btn.render()
+      self._cellular_btn.set_rect(rl.Rectangle(x + btn_w + gap, y, btn_w, btn_h))
+      self._cellular_btn.render()
+    elif self._current_panel == PanelType.WIFI:
+      content_rect = rl.Rectangle(self._rect.x, self._rect.y + self._back_btn.rect.height + 40,
+                                  self._rect.width, self._rect.height - self._back_btn.rect.height - 40)
+      self._back_btn.set_position(self._rect.x, self._rect.y + 20)
+      self._back_btn.render()
+      self._wifi_panel.render(content_rect)
+    else:
+      content_rect = rl.Rectangle(self._rect.x, self._rect.y + self._back_btn.rect.height + 40,
+                                  self._rect.width, self._rect.height - self._back_btn.rect.height - 40)
+      self._back_btn.set_position(self._rect.x, self._rect.y + 20)
+      self._back_btn.render()
+      self._cellular_panel.render(content_rect)
+
+
+class WifiPanel(Widget):
   def __init__(self, wifi_manager: WifiManager):
     super().__init__()
+    self._wifi_panel = self._child(WifiManagerUI(wifi_manager))
+    self._settings_panel = self._child(WifiAdvancedSettings(wifi_manager))
+    self._show_settings = False
+    self._settings_btn = self._child(NavButton(tr("Settings")))
+    self._settings_btn.set_click_callback(self._toggle_view)
+    self._networks_btn = self._child(NavButton(tr("Networks")))
+    self._networks_btn.set_click_callback(self._toggle_view)
+
+  def show_event(self):
+    super().show_event()
+    self._show_settings = False
+    self._wifi_panel.show_event()
+
+  def hide_event(self):
+    super().hide_event()
+    self._wifi_panel.hide_event()
+
+  def _toggle_view(self):
+    self._show_settings = not self._show_settings
+
+  def _render(self, rect: rl.Rectangle):
+    if self._show_settings:
+      nav_rect = rl.Rectangle(rect.x, rect.y, rect.width, self._networks_btn.rect.height)
+      self._networks_btn.set_rect(rl.Rectangle(rect.x + rect.width - self._networks_btn.rect.width, rect.y,
+                                                self._networks_btn.rect.width, self._networks_btn.rect.height))
+      self._networks_btn.render()
+      content_rect = rl.Rectangle(rect.x, rect.y + self._networks_btn.rect.height + 40,
+                                  rect.width, rect.height - self._networks_btn.rect.height - 40)
+      self._settings_panel.render(content_rect)
+    else:
+      self._settings_btn.set_rect(rl.Rectangle(rect.x + rect.width - self._settings_btn.rect.width, rect.y,
+                                                self._settings_btn.rect.width, self._settings_btn.rect.height))
+      self._settings_btn.render()
+      content_rect = rl.Rectangle(rect.x, rect.y + self._settings_btn.rect.height + 40,
+                                  rect.width, rect.height - self._settings_btn.rect.height - 40)
+      self._wifi_panel.render(content_rect)
+
+
+class CellularSettings(Widget):
+  def __init__(self, wifi_manager: WifiManager):
+    from openpilot.common.params import Params
+    from openpilot.selfdrive.ui.ui_state import ui_state
+    from openpilot.selfdrive.ui.lib.prime_state import PrimeType
+
+    super().__init__()
     self._wifi_manager = wifi_manager
-    self._wifi_manager.add_callbacks(networks_updated=self._on_network_updated)
     self._params = Params()
+    self._prime_state = ui_state.prime_state
+    self._cell_prime_types = (PrimeType.NONE, PrimeType.LITE)
 
-    self._keyboard = Keyboard(max_text_size=MAX_PASSWORD_LENGTH, min_text_size=MIN_PASSWORD_LENGTH, show_password_toggle=True)
+    self._modem_state: dict = {}
+    self._last_read: float = 0
 
-    # Tethering
-    self._tethering_action = ToggleAction(initial_state=False)
-    tethering_btn = ListItem(lambda: tr("Enable Tethering"), action_item=self._tethering_action, callback=self._toggle_tethering)
-
-    # Edit tethering password
-    self._tethering_password_action = ButtonAction(lambda: tr("EDIT"))
-    tethering_password_btn = ListItem(lambda: tr("Tethering Password"), action_item=self._tethering_password_action, callback=self._edit_tethering_password)
+    self._keyboard = Keyboard(max_text_size=MAX_PASSWORD_LENGTH, min_text_size=0, show_password_toggle=True)
 
     # Roaming toggle
     roaming_enabled = self._params.get_bool("GsmRoaming")
@@ -141,6 +199,119 @@ class AdvancedNetworkSettings(Widget):
     # APN setting
     self._apn_btn = button_item(lambda: tr("APN Setting"), lambda: tr("EDIT"), callback=self._edit_apn)
 
+    # Status items
+    items: list[Widget] = [
+      text_item(lambda: tr("Status"), lambda: self._fmt_state()),
+      text_item(lambda: tr("Signal"), lambda: self._fmt_signal()),
+      text_item(lambda: tr("Network Type"), lambda: self._modem_state.get("network_type", "N/A")),
+      text_item(lambda: tr("Operator"), lambda: self._modem_state.get("operator", "N/A")),
+      text_item(lambda: tr("IP Address"), lambda: self._modem_state.get("ip_address", "N/A")),
+      text_item(lambda: tr("Registration"), lambda: self._fmt_registration()),
+      text_item(lambda: tr("Band"), lambda: self._modem_state.get("band", "N/A")),
+      text_item(lambda: tr("Channel"), lambda: str(self._modem_state.get("channel", "N/A"))),
+      self._roaming_btn,
+      self._apn_btn,
+      self._cellular_metered_btn,
+      text_item(lambda: tr("IMEI"), lambda: self._modem_state.get("imei", "N/A")),
+      text_item(lambda: tr("ICCID"), lambda: self._modem_state.get("iccid", "N/A")),
+      text_item(lambda: tr("Data Sent"), lambda: self._fmt_bytes(self._modem_state.get("tx_bytes"))),
+      text_item(lambda: tr("Data Received"), lambda: self._fmt_bytes(self._modem_state.get("rx_bytes"))),
+    ]
+
+    self._scroller = Scroller(items, line_separator=True, spacing=0)
+
+  def _fmt_state(self) -> str:
+    raw = self._modem_state.get("state", "N/A")
+    return raw.title()
+
+  def _fmt_signal(self) -> str:
+    quality = self._modem_state.get("signal_quality")
+    strength = self._modem_state.get("signal_strength")
+    if quality is None:
+      return "N/A"
+    return f"{quality}%"
+
+  def _fmt_registration(self) -> str:
+    reg = self._modem_state.get("registration", "unknown")
+    return reg.replace("_", " ").title()
+
+  @staticmethod
+  def _fmt_bytes(val) -> str:
+    if not isinstance(val, (int, float)):
+      return "N/A"
+    b = float(val)
+    for unit in ['B', 'KB', 'MB', 'GB']:
+      if b < 1024:
+        return f"{b:.1f} {unit}"
+      b /= 1024
+    return f"{b:.1f} TB"
+
+  def _toggle_roaming(self):
+    self._params.put_bool("GsmRoaming", self._roaming_action.get_state(), block=True)
+
+  def _toggle_cellular_metered(self):
+    self._params.put_bool("GsmMetered", self._cellular_metered_action.get_state(), block=True)
+
+  def _edit_apn(self):
+    def update_apn(result: DialogResult):
+      if result != DialogResult.CONFIRM:
+        return
+      apn = self._keyboard.text.strip()
+      if apn == "":
+        self._params.remove("GsmApn")
+      else:
+        self._params.put("GsmApn", apn, block=True)
+
+    current_apn = self._params.get("GsmApn") or ""
+    self._keyboard.reset(min_text_size=0)
+    self._keyboard.set_title(tr("Enter APN"), tr("leave blank for automatic configuration"))
+    self._keyboard.set_text(current_apn)
+    self._keyboard.set_callback(update_apn)
+    gui_app.push_widget(self._keyboard)
+
+  def _update_state(self):
+    now = time.monotonic()
+    if now - self._last_read > 0.5:
+      self._last_read = now
+      try:
+        with open("/dev/shm/modem") as f:
+          self._modem_state = json.load(f)
+      except (FileNotFoundError, json.JSONDecodeError):
+        self._modem_state = {}
+
+    show_cell_settings = self._prime_state.get_type() in self._cell_prime_types
+    self._wifi_manager.set_ipv4_forward(show_cell_settings)
+    self._roaming_btn.set_visible(show_cell_settings)
+    self._apn_btn.set_visible(show_cell_settings)
+    self._cellular_metered_btn.set_visible(show_cell_settings)
+
+  def _render(self, _):
+    self._scroller.render(self._rect)
+
+
+class WifiAdvancedSettings(Widget):
+  def __init__(self, wifi_manager: WifiManager):
+    # WifiAdvancedSettings needs the full openpilot environment, standalone apps just use WifiManagerUI
+    from openpilot.common.params import Params
+    from openpilot.selfdrive.ui.ui_state import ui_state
+    from openpilot.selfdrive.ui.lib.prime_state import PrimeType
+    super().__init__()
+    self._wifi_manager = wifi_manager
+    self._wifi_manager.add_callbacks(networks_updated=self._on_network_updated)
+    self._params = Params()
+    self._prime_state = ui_state.prime_state
+    self._cell_prime_types = (PrimeType.NONE, PrimeType.LITE)
+
+    self._keyboard = Keyboard(max_text_size=MAX_PASSWORD_LENGTH, min_text_size=MIN_PASSWORD_LENGTH, show_password_toggle=True)
+
+    # Tethering
+    self._tethering_action = ToggleAction(initial_state=False)
+    tethering_btn = ListItem(lambda: tr("Enable Tethering"), action_item=self._tethering_action, callback=self._toggle_tethering)
+
+    # Edit tethering password
+    self._tethering_password_action = ButtonAction(lambda: tr("EDIT"))
+    tethering_password_btn = ListItem(lambda: tr("Tethering Password"), action_item=self._tethering_password_action, callback=self._edit_tethering_password)
+
     # Wi-Fi metered toggle
     self._wifi_metered_action = MultipleButtonAction([lambda: tr("default"), lambda: tr("metered"), lambda: tr("unmetered")], 255, 0,
                                                      callback=self._toggle_wifi_metered)
@@ -151,9 +322,6 @@ class AdvancedNetworkSettings(Widget):
       tethering_btn,
       tethering_password_btn,
       text_item(lambda: tr("IP Address"), lambda: self._wifi_manager.ipv4_address),
-      self._roaming_btn,
-      self._apn_btn,
-      self._cellular_metered_btn,
       wifi_metered_btn,
       button_item(lambda: tr("Hidden Network"), lambda: tr("CONNECT"), callback=self._connect_to_hidden_network),
     ]
@@ -179,30 +347,6 @@ class AdvancedNetworkSettings(Widget):
     if checked:
       self._wifi_metered_action.set_enabled(False)
     self._wifi_manager.set_tethering_active(checked)
-
-  def _toggle_roaming(self):
-    self._params.put_bool("GsmRoaming", self._roaming_action.get_state(), block=True)
-
-  def _edit_apn(self):
-    def update_apn(result: DialogResult):
-      if result != DialogResult.CONFIRM:
-        return
-
-      apn = self._keyboard.text.strip()
-      if apn == "":
-        self._params.remove("GsmApn")
-      else:
-        self._params.put("GsmApn", apn, block=True)
-
-    current_apn = self._params.get("GsmApn") or ""
-    self._keyboard.reset(min_text_size=0)
-    self._keyboard.set_title(tr("Enter APN"), tr("leave blank for automatic configuration"))
-    self._keyboard.set_text(current_apn)
-    self._keyboard.set_callback(update_apn)
-    gui_app.push_widget(self._keyboard)
-
-  def _toggle_cellular_metered(self):
-    self._params.put_bool("GsmMetered", self._cellular_metered_action.get_state(), block=True)
 
   def _toggle_wifi_metered(self, metered):
     metered_type = {0: MeteredType.UNKNOWN, 1: MeteredType.YES, 2: MeteredType.NO}.get(metered, MeteredType.UNKNOWN)
@@ -257,13 +401,8 @@ class AdvancedNetworkSettings(Widget):
 
   def _update_state(self):
     self._wifi_manager.process_callbacks()
-
-    # If not using prime SIM, show GSM settings and enable IPv4 forwarding
-    show_cell_settings = ui_state.prime_state.get_type() in (PrimeType.NONE, PrimeType.LITE)
+    show_cell_settings = self._prime_state.get_type() in self._cell_prime_types
     self._wifi_manager.set_ipv4_forward(show_cell_settings)
-    self._roaming_btn.set_visible(show_cell_settings)
-    self._apn_btn.set_visible(show_cell_settings)
-    self._cellular_metered_btn.set_visible(show_cell_settings)
 
   def _render(self, _):
     self._scroller.render(self._rect)

@@ -1,7 +1,10 @@
+import json
+import time
+
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.mici.layouts.settings.network import WifiNetworkButton
 from openpilot.selfdrive.ui.mici.layouts.settings.network.wifi_ui import WifiUIMici
-from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigMultiToggle, BigParamControl, BigToggle
+from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigMultiToggle, BigParamControl, BigToggle, GreyBigButton
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigInputDialog
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.lib.prime_state import PrimeType
@@ -75,12 +78,30 @@ class NetworkLayoutMici(NavScroller):
     # ******** Cellular metered toggle ********
     self._cellular_metered_btn = BigParamControl("cellular metered", "GsmMetered")
 
+    # ******** Cellular status ********
+    self._modem_state: dict = {}
+    self._last_read: float = 0
+    self._status_btn = GreyBigButton("status", "N/A")
+    self._signal_btn = GreyBigButton("signal", "N/A")
+    self._network_type_btn = GreyBigButton("network type", "N/A")
+    self._operator_btn = GreyBigButton("operator", "N/A")
+    self._ip_btn = GreyBigButton("ip address", "N/A")
+    self._registration_btn = GreyBigButton("registration", "N/A")
+
     # Main scroller ----------------------------------
     self._scroller.add_widgets([
       self._wifi_button,
       self._network_metered_btn,
       self._tethering_toggle_btn,
       self._tethering_password_btn,
+      # /* Cellular status
+      self._status_btn,
+      self._signal_btn,
+      self._network_type_btn,
+      self._operator_btn,
+      self._ip_btn,
+      self._registration_btn,
+      # */
       # /* Advanced settings
       self._roaming_btn,
       self._apn_btn,
@@ -91,9 +112,34 @@ class NetworkLayoutMici(NavScroller):
   def _update_state(self):
     super()._update_state()
 
+    # Read modem state
+    now = time.monotonic()
+    if now - self._last_read > 0.5:
+      self._last_read = now
+      try:
+        with open("/dev/shm/modem") as f:
+          self._modem_state = json.load(f)
+      except (FileNotFoundError, json.JSONDecodeError):
+        self._modem_state = {}
+
+    quality = self._modem_state.get("signal_quality")
+    self._status_btn.set_value(self._modem_state.get("state", "N/A").title())
+    self._signal_btn.set_value(f"{quality}%" if quality is not None else "N/A")
+    self._network_type_btn.set_value(self._modem_state.get("network_type", "N/A"))
+    self._operator_btn.set_value(self._modem_state.get("operator", "N/A"))
+    self._ip_btn.set_value(self._modem_state.get("ip_address", "N/A"))
+    reg = self._modem_state.get("registration", "N/A").replace("_", " ").title()
+    self._registration_btn.set_value(reg)
+
     # If not using prime SIM, show GSM settings and enable IPv4 forwarding
     show_cell_settings = ui_state.prime_state.get_type() in (PrimeType.NONE, PrimeType.LITE)
     self._wifi_manager.set_ipv4_forward(show_cell_settings)
+    self._status_btn.set_visible(show_cell_settings)
+    self._signal_btn.set_visible(show_cell_settings)
+    self._network_type_btn.set_visible(show_cell_settings)
+    self._operator_btn.set_visible(show_cell_settings)
+    self._ip_btn.set_visible(show_cell_settings)
+    self._registration_btn.set_visible(show_cell_settings)
     self._roaming_btn.set_visible(show_cell_settings)
     self._apn_btn.set_visible(show_cell_settings)
     self._cellular_metered_btn.set_visible(show_cell_settings)
