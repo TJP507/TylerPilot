@@ -42,5 +42,5 @@ class NetworkUISP(NetworkUI):
     super()._render(_)
 
     if self._current_panel == PanelType.WIFI:
-      self.scan_button.set_position(self._rect.x + 20, self._rect.y + self._back_btn.rect.height + 40)
+      self.scan_button.set_position(self._rect.x + self._back_btn.rect.width + 20, self._rect.y + 20)
       self.scan_button.render()
