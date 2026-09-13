@@ -309,6 +309,35 @@ class _Decoder(threading.Thread):
     container.close()
 
 
+class _IconButton(Button):
+  """Button with a centered icon and no text."""
+
+  def __init__(self, icon_path: str, callback, icon_size: int = 84, button_style: ButtonStyle = ButtonStyle.NORMAL):
+    super().__init__("", callback, font_size=44, button_style=button_style)
+    self._icon_path = icon_path
+    self._icon_size = icon_size
+    self._icon_tex: rl.Texture | None = None
+
+  def set_icon(self, icon_path: str) -> None:
+    if icon_path != self._icon_path:
+      self._icon_path = icon_path
+      self._icon_tex = None
+
+  def _render(self, rect: rl.Rectangle) -> None:
+    super()._render(rect)
+    if self._icon_tex is None:
+      self._icon_tex = gui_app.texture(self._icon_path, self._icon_size, self._icon_size, keep_aspect_ratio=True)
+    if self.is_pressed:
+      color = rl.Color(200, 200, 200, 255)
+    elif not self.enabled:
+      color = rl.Color(255, 255, 255, 90)
+    else:
+      color = rl.WHITE
+    x = rect.x + (rect.width - self._icon_tex.width) / 2
+    y = rect.y + (rect.height - self._icon_tex.height) / 2
+    rl.draw_texture_ex(self._icon_tex, rl.Vector2(x, y), 0.0, 1.0, color)
+
+
 class DashCamPlayer(NavWidget):
   """Full screen, offroad-only player with play/pause, clip skip and 10s seek."""
 
@@ -328,12 +357,12 @@ class DashCamPlayer(NavWidget):
     self._font = gui_app.font(FontWeight.MEDIUM)
     self._small_font = gui_app.font(FontWeight.NORMAL)
 
-    self._btn_prev = self._child(Button("Prev", self._prev_clip, font_size=44))
-    self._btn_back10 = self._child(Button("-10s", lambda: self._seek_rel(-10), font_size=44))
-    self._btn_play = self._child(Button("Pause", self._toggle_play, font_size=44, button_style=ButtonStyle.PRIMARY))
-    self._btn_fwd10 = self._child(Button("+10s", lambda: self._seek_rel(10), font_size=44))
-    self._btn_next = self._child(Button("Next", self._next_clip, font_size=44))
-    self._btn_close = self._child(Button("X", lambda: self.dismiss(), font_size=44, button_style=ButtonStyle.DANGER))
+    self._btn_prev = self._child(_IconButton("icons/previous.png", self._prev_clip))
+    self._btn_back10 = self._child(_IconButton("icons/seek-back-10.png", lambda: self._seek_rel(-10)))
+    self._btn_play = self._child(_IconButton("icons/pause.png", self._toggle_play, button_style=ButtonStyle.PRIMARY))
+    self._btn_fwd10 = self._child(_IconButton("icons/seek-forward-10.png", lambda: self._seek_rel(10)))
+    self._btn_next = self._child(_IconButton("icons/next.png", self._next_clip))
+    self._btn_close = self._child(_IconButton("icons/close2.png", lambda: self.dismiss(), button_style=ButtonStyle.DANGER))
 
   # ---- lifecycle ----
   def show_event(self) -> None:
@@ -359,7 +388,7 @@ class DashCamPlayer(NavWidget):
     self._error = None
     self._last_seq = -1
     self._playing = True
-    self._btn_play.set_text("Pause")
+    self._btn_play.set_icon("icons/pause.png")
     clip = self._clips[self._index]
     self._decoder = _Decoder(clip.path, self._tex_w, self._tex_h)
     self._decoder.start()
@@ -374,7 +403,7 @@ class DashCamPlayer(NavWidget):
     self._playing = not self._playing
     if self._decoder is not None:
       self._decoder.set_playing(self._playing)
-    self._btn_play.set_text("Pause" if self._playing else "Play")
+    self._btn_play.set_icon("icons/pause.png" if self._playing else "icons/play.png")
 
   def _seek_rel(self, seconds: float) -> None:
     if self._decoder is None:
