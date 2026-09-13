@@ -229,6 +229,7 @@ class Device(DeviceSP):
 
     self._offroad_brightness: int = BACKLIGHT_OFFROAD
     self._last_brightness: int = 0
+    self._offroad_brightness_timer: int = 0
     self._brightness_filter = FirstOrderFilter(BACKLIGHT_OFFROAD, 10.00, 1 / gui_app.target_fps)
     self._brightness_thread: threading.Thread | None = None
     self._brightness_event = threading.Event()
@@ -310,6 +311,9 @@ class Device(DeviceSP):
     if gui_app.sunnypilot_ui():
       brightness = DeviceSP.set_onroad_brightness(ui_state, self._awake, brightness)
 
+    if gui_app.sunnypilot_ui() and self._awake and not ui_state.started:
+      brightness = self._apply_offroad_brightness(brightness)
+
     if not self._awake:
       brightness = 0
 
@@ -317,6 +321,41 @@ class Device(DeviceSP):
       self._brightness_target = brightness
       self._brightness_event.set()
       self._last_brightness = brightness
+
+  def _apply_offroad_brightness(self, cur_brightness: float) -> float:
+    try:
+      with open("/data/community/offroad_brightness.json") as f:
+        import json
+        cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+      return cur_brightness
+
+    val = cfg.get("brightness", 0)
+    timer_idx = cfg.get("timer", 0)
+
+    if val == 0:
+      return cur_brightness
+    if val == 2:
+      return 0.0
+
+    if self._offroad_brightness_timer > 0:
+      return cur_brightness
+
+    return float((val - 2) * 5)
+
+  def _reset_offroad_timer(self):
+    try:
+      with open("/data/community/offroad_brightness.json") as f:
+        import json
+        cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+      return
+    timer_idx = cfg.get("timer", 0)
+    if timer_idx == 0:
+      return
+    from openpilot.sunnypilot.system.params_migration import ONROAD_BRIGHTNESS_TIMER_VALUES
+    secs = ONROAD_BRIGHTNESS_TIMER_VALUES.get(timer_idx, 3)
+    self._offroad_brightness_timer = secs * gui_app.target_fps
 
   def _update_wakefulness(self):
     # Handle interactive timeout
@@ -328,6 +367,13 @@ class Device(DeviceSP):
         DeviceSP.wake_from_dimmed_onroad_brightness(ui_state, gui_app.mouse_events)
 
       self._reset_interactive_timeout()
+      if not ui_state.started:
+        self._reset_offroad_timer()
+    elif gui_app.sunnypilot_ui() and not ui_state.started and self._offroad_brightness_timer > 0:
+      self._offroad_brightness_timer -= 1
+
+    if ignition_just_turned_off:
+      self._reset_offroad_timer()
 
     interaction_timeout = time.monotonic() > self._interaction_time
     if interaction_timeout and not self._prev_timed_out:
