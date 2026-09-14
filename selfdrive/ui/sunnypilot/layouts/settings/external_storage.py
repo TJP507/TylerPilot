@@ -486,12 +486,10 @@ class ExternalStoragePanel(NavWidget):
 
     def cb(result: int):
       if result == DialogResult.CONFIRM:
-        self._run_action(format_whole_drive, disk, tr("Formatting") + f" /dev/{disk} (FAT32)",
-                         tr("Formatted") + f" /dev/{disk} (FAT32)")
+        self._run_action(format_whole_drive, disk, tr("Erasing") + f" /dev/{disk}", tr("Erased") + f" /dev/{disk}")
 
-    msg = (tr("Erase ALL partitions and data on") + f" /dev/{disk} " +
-           tr("and format the entire drive as FAT32?"))
-    gui_app.push_widget(ConfirmDialog(msg, tr("Format drive"), callback=cb))
+    msg = tr("Are you sure you want to delete all of the data on this device?")
+    gui_app.push_widget(ConfirmDialog(msg, tr("Erase Storage"), callback=cb, confirm_style=ButtonStyle.DANGER))
 
   def _run_action(self, fn, arg, start_label: str, done_label: str, *args) -> None:
     with _OP_LOCK:
