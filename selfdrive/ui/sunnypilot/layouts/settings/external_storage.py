@@ -383,7 +383,7 @@ class _DriveRow(Widget):
     self._small = gui_app.font(FontWeight.NORMAL)
 
     self._btn_toggle = self._child(Button(tr("Mount"), lambda: panel.toggle_mount(entry), font_size=40))
-    self._btn_fat = self._child(Button(tr("Format FAT32"), lambda: panel.confirm_format_drive(disk),
+    self._btn_fat = self._child(Button(tr("Format Storage"), lambda: panel.confirm_format_drive(disk),
                                        font_size=40, button_style=ButtonStyle.DANGER))
 
   def set_parent_rect(self, parent_rect: rl.Rectangle) -> None:
@@ -406,10 +406,8 @@ class _DriveRow(Widget):
     elif mountable:
       rl.draw_text_ex(self._small, tr("Not mounted"), rl.Vector2(rect.x + 40, rect.y + 92), 34, 0, SUBTEXT_COLOR)
     else:
-      hint = tr("Unsupported filesystem") + f" ({fstype or tr('unformatted')}) - " + tr("format FAT32 first")
+      hint = tr("Unsupported filesystem") + f" ({fstype or tr('unformatted')}) - " + tr("format the disk to use it")
       rl.draw_text_ex(self._small, hint, rl.Vector2(rect.x + 40, rect.y + 92), 34, 0, WARN_COLOR)
-    rl.draw_text_ex(self._small, tr("Formatting erases the partition table and all data on this drive."),
-                    rl.Vector2(rect.x + 40, rect.y + 140), 30, 0, WARN_COLOR)
 
     self._btn_toggle.set_text(tr("Unmount") if mounted else tr("Mount"))
     busy = operation_active()
@@ -536,20 +534,17 @@ class ExternalStoragePanel(NavWidget):
     self._btn_rescan.render(rl.Rectangle(rect.x + rect.width - 240, rect.y, 240, 84))
     rl.draw_text_ex(self._font, tr("External Storage"), rl.Vector2(rect.x + 240, rect.y + 8), 56, 0, TEXT_COLOR)
 
-    info = tr("USB drives are mounted under") + f" {MOUNT_ROOT}/<device>."
-    rl.draw_text_ex(self._small, info, rl.Vector2(rect.x, rect.y + 110), 34, 0, SUBTEXT_COLOR)
-
     active, label, result, failed, _ = operation_status()
     line = label if active else result
     if line:
       color = WARN_COLOR if active else (rl.RED if failed else GOOD_COLOR)
       text_x = rect.x
       if active:
-        _draw_spinner(rect.x + 18, rect.y + 167, 18, color)
+        _draw_spinner(rect.x + 18, rect.y + 127, 18, color)
         text_x = rect.x + 52
-      rl.draw_text_ex(self._small, line, rl.Vector2(text_x, rect.y + 150), 34, 0, color)
+      rl.draw_text_ex(self._small, line, rl.Vector2(text_x, rect.y + 110), 34, 0, color)
 
-    list_y = rect.y + 210
+    list_y = rect.y + 170
     list_rect = rl.Rectangle(rect.x, list_y, rect.width, max(rect.height - (list_y - rect.y), 0))
     if self._rows:
       self._scroller.render(list_rect)
