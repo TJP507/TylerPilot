@@ -10,6 +10,7 @@ from pathlib import Path
 
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.layouts.settings.developer import DeveloperLayout
+from openpilot.selfdrive.ui.sunnypilot.layouts.settings.external_storage import ExternalStoragePanel
 from openpilot.system.hardware import PC
 from openpilot.system.hardware.hw import Paths
 from openpilot.system.ui.lib.application import gui_app
@@ -52,7 +53,15 @@ class DeveloperLayoutSP(DeveloperLayout):
 
     self.error_log_btn = button_item(tr("Error Log"), tr("VIEW"), tr("View the error log for sunnypilot crashes."), callback=self._on_error_log_clicked)
 
-    self.items: list = [self.show_advanced_controls, self.enable_github_runner_toggle, self.enable_copyparty_toggle, self.prebuilt_toggle, self.error_log_btn,]
+    self.external_storage_btn = button_item(tr("External Storage"), tr("MANAGE"),
+                                            tr("Mount, unmount or format USB drives connected to the device. Formatting erases all data."),
+                                            callback=self._on_external_storage_clicked)
+
+    self.items: list = [self.show_advanced_controls, self.enable_github_runner_toggle, self.enable_copyparty_toggle, self.prebuilt_toggle,
+                        self.error_log_btn, self.external_storage_btn,]
+
+  def _on_external_storage_clicked(self):
+    gui_app.push_widget(ExternalStoragePanel())
 
   @staticmethod
   def _on_prebuilt_toggled(state):
