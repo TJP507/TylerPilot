@@ -19,6 +19,7 @@ kept as a fallback when the helper is unavailable.
 Playback is only permitted while the device is offroad.
 """
 import bisect
+import fcntl
 import io
 import os
 import select
@@ -115,6 +116,11 @@ class Clip:
   @property
   def time_text(self) -> str:
     return time.strftime("%I:%M:%S %p", time.localtime(self.mtime))
+
+
+def _fmt_time(seconds: float) -> str:
+  s = max(0, int(seconds))
+  return f"{s // 60:02d}:{s % 60:02d}"
 
 
 def list_clips(camera_file: str) -> list[Clip]:
@@ -382,6 +388,7 @@ class _HardwareDecoder(threading.Thread):
     self._eof = False
     self._error: str | None = None
     self._seek_to: int | None = None
+    self._flush_target = -1
 
     self._img_w = 0
     self._img_h = 0
@@ -439,42 +446,54 @@ class _HardwareDecoder(threading.Thread):
     session_stop = threading.Event()
     frames = self._files
 
+    # Writes must never block: while paused the decoder's input pipe fills up,
+    # and a blocking write would strand the feed thread where it could never
+    # observe a pending seek. A non-blocking pipe lets us poll stop/seek.
+    stdin_fd = proc.stdin.fileno()
+    try:
+      fl = fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
+      fcntl.fcntl(stdin_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    except OSError:
+      pass
+
+    def write_all(data: bytes) -> bool:
+      view = memoryview(data)
+      off = 0
+      while off < len(view):
+        if self._stop_ev.is_set() or session_stop.is_set():
+          return False
+        with self._lock:
+          if self._seek_to is not None:
+            return False
+        try:
+          off += os.write(stdin_fd, view[off:])
+        except BlockingIOError:
+          time.sleep(0.005)
+        except OSError:
+          return False
+      return True
+
     def feed():
       i = start_idx
       normal = False
-      fed_count = 0
       try:
+        # HEVC parameter sets (VPS/SPS/PPS) only appear once, at the top of the
+        # file. A session that starts mid-file must re-send them before the
+        # first IDR, otherwise msm_vidc emits blank frames.
+        if start_idx > 0 and self._prefix:
+          if not write_all(struct.pack("<I", len(self._prefix)) + self._prefix):
+            return
         with open(self._path, "rb") as fh:
-          # HEVC parameter sets (VPS/SPS/PPS) only appear once, at the top of the
-          # file. A session that starts mid-file must re-send them before the
-          # first IDR, otherwise msm_vidc emits blank frames.
-          if start_idx > 0 and self._prefix:
-            try:
-              proc.stdin.write(struct.pack("<I", len(self._prefix)))
-              proc.stdin.write(self._prefix)
-              proc.stdin.flush()
-            except (BrokenPipeError, OSError, ValueError):
-              return
           while i < len(frames) and not self._stop_ev.is_set():
             with self._lock:
               if self._seek_to is not None:
                 return
-            if not self._play_ev.is_set() and fed_count >= 40:
-              time.sleep(0.02)
-              continue
-            # While paused, feed a short burst so the pipeline flushes and a
-            # seek target actually becomes visible, then hold.
             _key, pos, size = frames[i]
             fh.seek(pos)
             data = fh.read(size)
-            try:
-              proc.stdin.write(struct.pack("<I", len(data)))
-              proc.stdin.write(data)
-              proc.stdin.flush()
-            except (BrokenPipeError, OSError, ValueError):
+            if not write_all(struct.pack("<I", len(data)) + data):
               return
             i += 1
-            fed_count += 1
           normal = i >= len(frames) and not self._stop_ev.is_set()
       finally:
         _dbg("feed end at", i, "normal", normal)
@@ -495,8 +514,23 @@ class _HardwareDecoder(threading.Thread):
     _dbg("session start", start_idx, "img", self._img_w, self._img_h)
 
     frames_read = 0
-    t_session = time.monotonic()
+    pace_frames = 0
+    pace_time = time.monotonic()
+    was_playing = False
     while not session_stop.is_set() and not self._stop_ev.is_set():
+      playing = self._play_ev.is_set()
+      with self._lock:
+        flush_target = self._flush_target
+      # While paused (and not flushing toward a seek target) hold the last
+      # frame instead of draining the decoder's ~2s pipeline.
+      if not playing and flush_target < 0:
+        time.sleep(0.02)
+        continue
+      if playing and not was_playing:
+        pace_frames = frames_read
+        pace_time = time.monotonic()
+      was_playing = playing
+
       ready, _, _ = select.select([proc.stdout], [], [], 0.05)
       if not ready:
         continue
@@ -525,10 +559,16 @@ class _HardwareDecoder(threading.Thread):
       if frames_read % 60 == 0:
         _dbg("frames_read", frames_read)
 
-      # Pace playback to the recording frame rate (hardware decode is faster).
-      drift = (frames_read / PLAYER_FPS) - (time.monotonic() - t_session)
-      if drift > 0:
-        time.sleep(drift)
+      if playing:
+        # Pace playback to the recording frame rate (hardware decode is faster).
+        drift = ((frames_read - pace_frames) / PLAYER_FPS) - (time.monotonic() - pace_time)
+        if drift > 0:
+          time.sleep(drift)
+      else:
+        # Paused seek: once the requested frame is on screen, hold it.
+        with self._lock:
+          if self._flush_target >= 0 and self._fidx >= self._flush_target:
+            self._flush_target = -1
 
     session_stop.set()
     _dbg("session end", start_idx, "read", frames_read, "writer_alive", writer.is_alive())
@@ -546,11 +586,13 @@ class _HardwareDecoder(threading.Thread):
     drain_thread.start()
 
     try:
+      os.write(stdin_fd, struct.pack("<I", 0))
+    except OSError:
+      pass
+    try:
       if proc.stdin is not None:
-        proc.stdin.write(struct.pack("<I", 0))
-        proc.stdin.flush()
         proc.stdin.close()
-    except (OSError, ValueError):
+    except OSError:
       pass
 
     try:
@@ -600,12 +642,24 @@ class _HardwareDecoder(threading.Thread):
       seek = self._take_seek()
       if seek is not None:
         start = self._snap_to_gop(seek)
+        # A seek while paused should still show its target frame: let the reader
+        # consume frames up to the target, then hold.
+        with self._lock:
+          self._flush_target = seek if not self._play_ev.is_set() else -1
+      elif not self._play_ev.is_set():
+        # Paused with nothing to do; wait for play or a new seek.
+        self._stop_ev.wait(0.05)
+        continue
       self._session(start)
+      with self._lock:
+        self._flush_target = -1
       if self._stop_ev.is_set():
         break
       with self._lock:
         another_seek = self._seek_to is not None
       if another_seek:
+        continue
+      if not self._play_ev.is_set():
         continue
       with self._lock:
         self._eof = True
@@ -613,6 +667,8 @@ class _HardwareDecoder(threading.Thread):
         with self._lock:
           if self._seek_to is not None:
             break
+        if not self._play_ev.is_set():
+          break
         time.sleep(0.05)
       with self._lock:
         self._eof = False
@@ -794,8 +850,10 @@ class DashCamPlayer(NavWidget):
 
   # ---- rendering ----
   def _render(self, rect: rl.Rectangle) -> None:
+    cur_fidx = 0
+    total = 0
     if self._decoder is not None:
-      frame, fw, fh, seq, _, _, _eof, err = self._decoder.snapshot()
+      frame, fw, fh, seq, cur_fidx, total, _eof, err = self._decoder.snapshot()
       if err:
         self._error = err
       if frame is not None and seq != self._last_seq and fw > 0 and fh > 0:
@@ -825,6 +883,10 @@ class DashCamPlayer(NavWidget):
       clip = self._clips[self._index]
       title = f"{clip.date_text}   {clip.time_text}   -   segment {clip.segment}"
       rl.draw_text_ex(self._font, title, rl.Vector2(rect.x + 40, rect.y + 30), 40, 0, rl.WHITE)
+      if total > 0:
+        label = f"{_fmt_time(cur_fidx / PLAYER_FPS)} / {_fmt_time(total / PLAYER_FPS)}"
+        size = measure_text_cached(self._font, label, 40)
+        rl.draw_text_ex(self._font, label, rl.Vector2(rect.x + rect.width - 40 - size.x, rect.y + 30), 40, 0, rl.WHITE)
 
     if self._error:
       rl.draw_text_ex(self._font, self._error, rl.Vector2(video_rect.x + 20, video_rect.y + 20), 36, 0, rl.RED)
