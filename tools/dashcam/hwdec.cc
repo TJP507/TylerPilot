@@ -33,6 +33,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -163,6 +164,7 @@ class MsmVidc {
 
   MsmVidc() = default;
   ~MsmVidc() {
+    shutdown();
     if (fd > 0) close(fd);
   }
 
@@ -199,7 +201,10 @@ class MsmVidc {
       while (true) {
         uint32_t len = 0;
         if (fread(&len, 4, 1, stdin) != 1) break;
-        if (len == 0) break;
+        if (len == 0) {
+          abort_requested = true;
+          break;
+        }
         auto pkt = std::make_shared<std::vector<uint8_t>>(len);
         if (fread(pkt->data(), 1, len, stdin) != len) break;
         {
@@ -217,13 +222,17 @@ class MsmVidc {
 
     bool eos_sent = false;
     double eos_deadline = 0;
+    int rc = 0;
 
-    while (true) {
+    while (!abort_requested) {
       feedQueued();
 
       int timeout = input_done ? 30 : 15;
       int r = pump(timeout);
-      if (r < 0) return 1;
+      if (r < 0) {
+        rc = 1;
+        break;
+      }
       if (r == 1) {
         emitFrame();
         releaseFrame();
@@ -246,8 +255,9 @@ class MsmVidc {
     }
 
     reader.join();
+    shutdown();
     DBG("hwdec wrote %d frames", frames_out);
-    return 0;
+    return rc;
   }
 
  private:
@@ -544,9 +554,26 @@ class MsmVidc {
     xioctl(fd, VIDIOC_DECODER_CMD, &command);
   }
 
+  // Stop both queues and release the ION buffers so the msm_vidc driver frees
+  // its internal allocations. Without this, repeated decoder sessions leak
+  // driver memory and later inits fail with ENOMEM.
+  void shutdown() {
+    if (fd <= 0 || torn_down) return;
+    torn_down = true;
+    v4l2_buf_type out = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    v4l2_buf_type cap = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    xioctl(fd, VIDIOC_STREAMOFF, &cap);
+    xioctl(fd, VIDIOC_STREAMOFF, &out);
+    for (int i = 0; i < CAPTURE_BUFFER_COUNT; i++) cap_bufs[i].free_buf();
+    for (int i = 0; i < OUTPUT_BUFFER_COUNT; i++) out_bufs[i].free_buf();
+    tight_frame.free_buf();
+  }
+
   int fd = 0;
   bool initialized = false;
   bool reconfigure_pending = false;
+  bool torn_down = false;
+  std::atomic<bool> abort_requested{false};
 
   size_t w = 1928, h = 1208;
   size_t orig_w = 1928, orig_h = 1208;

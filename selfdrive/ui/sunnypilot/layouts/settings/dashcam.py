@@ -427,13 +427,19 @@ class _HardwareDecoder(threading.Thread):
 
   # ---- session: one hwdec process fed from start_idx ----
   def _session(self, start_idx: int) -> None:
-    proc = subprocess.Popen([HWDEC_PATH, str(self._img_w), str(self._img_h)],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+      proc = subprocess.Popen([HWDEC_PATH, str(self._img_w), str(self._img_h)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as e:
+      with self._lock:
+        self._error = f"hardware decoder unavailable: {e}"
+      return
     session_stop = threading.Event()
     frames = self._files
 
     def feed():
       i = start_idx
+      normal = False
       try:
         with open(self._path, "rb") as fh:
           while i < len(frames) and not self._stop_ev.is_set():
@@ -451,18 +457,20 @@ class _HardwareDecoder(threading.Thread):
               proc.stdin.write(struct.pack("<I", len(data)))
               proc.stdin.write(data)
               proc.stdin.flush()
-            except (BrokenPipeError, OSError):
+            except (BrokenPipeError, OSError, ValueError):
               return
             i += 1
+          normal = i >= len(frames) and not self._stop_ev.is_set()
       finally:
-        _dbg("feed end at", i)
-        # Close stdin so the decoder flushes its pipeline and exits; the reader
-        # keeps draining stdout until EOF.
-        try:
-          if proc.stdin is not None:
-            proc.stdin.close()
-        except OSError:
-          pass
+        _dbg("feed end at", i, "normal", normal)
+        # On natural end-of-clip, close stdin so the decoder flushes (EOS) and
+        # exits. On stop/seek the main thread sends an explicit abort instead.
+        if normal:
+          try:
+            if proc.stdin is not None:
+              proc.stdin.close()
+          except OSError:
+            pass
 
     writer = threading.Thread(target=feed, daemon=True)
     writer.start()
@@ -503,13 +511,33 @@ class _HardwareDecoder(threading.Thread):
 
     session_stop.set()
     _dbg("session end", start_idx, "read", frames_read, "writer_alive", writer.is_alive())
+
+    # Drain stdout first so the decoder can't block on a full output pipe, then
+    # send an explicit abort so it tears down (STREAMOFF + free ION) and exits.
+    def _drain():
+      try:
+        while proc.stdout is not None and proc.stdout.read(65536):
+          pass
+      except (OSError, ValueError):
+        pass
+
+    drain_thread = threading.Thread(target=_drain, daemon=True)
+    drain_thread.start()
+
     try:
       if proc.stdin is not None:
+        proc.stdin.write(struct.pack("<I", 0))
+        proc.stdin.flush()
         proc.stdin.close()
-    except OSError:
+    except (OSError, ValueError):
       pass
-    proc.kill()
-    proc.wait()
+
+    try:
+      proc.wait(timeout=3.0)
+    except subprocess.TimeoutExpired:
+      proc.kill()
+      proc.wait()
+    drain_thread.join(timeout=1.0)
     writer.join(timeout=1.0)
 
   def run(self) -> None:
