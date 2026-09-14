@@ -21,6 +21,7 @@ Playback is only permitted while the device is offroad.
 import bisect
 import io
 import os
+import select
 import struct
 import subprocess
 import sys
@@ -440,16 +441,18 @@ class _HardwareDecoder(threading.Thread):
     def feed():
       i = start_idx
       normal = False
+      fed_any = False
       try:
         with open(self._path, "rb") as fh:
           while i < len(frames) and not self._stop_ev.is_set():
-            if not self._play_ev.is_set():
-              time.sleep(0.02)
-              continue
             with self._lock:
               if self._seek_to is not None:
-                session_stop.set()
                 return
+            if not self._play_ev.is_set():
+              if fed_any:
+                time.sleep(0.02)
+                continue
+              # Paused: feed a single frame so a seek target is visible, then hold.
             _key, pos, size = frames[i]
             fh.seek(pos)
             data = fh.read(size)
@@ -460,17 +463,21 @@ class _HardwareDecoder(threading.Thread):
             except (BrokenPipeError, OSError, ValueError):
               return
             i += 1
+            fed_any = True
           normal = i >= len(frames) and not self._stop_ev.is_set()
       finally:
         _dbg("feed end at", i, "normal", normal)
         # On natural end-of-clip, close stdin so the decoder flushes (EOS) and
-        # exits. On stop/seek the main thread sends an explicit abort instead.
+        # exits. Any other exit means the session is being torn down, so make
+        # sure the reader loop stops waiting on it.
         if normal:
           try:
             if proc.stdin is not None:
               proc.stdin.close()
           except OSError:
             pass
+        else:
+          session_stop.set()
 
     writer = threading.Thread(target=feed, daemon=True)
     writer.start()
@@ -479,6 +486,9 @@ class _HardwareDecoder(threading.Thread):
     frames_read = 0
     t_session = time.monotonic()
     while not session_stop.is_set() and not self._stop_ev.is_set():
+      ready, _, _ = select.select([proc.stdout], [], [], 0.05)
+      if not ready:
+        continue
       hdr = self._read_exact(proc.stdout, 12)
       if hdr is None:
         _dbg("reader EOF after", frames_read)
