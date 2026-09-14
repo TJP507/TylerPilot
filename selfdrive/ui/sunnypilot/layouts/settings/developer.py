@@ -12,6 +12,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.layouts.settings.developer import DeveloperLayout
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.external_storage import ExternalStoragePanel
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.tailscale import TailscalePanel
+from openpilot.selfdrive.ui.sunnypilot.layouts.settings.webdashcam import WebDashcamPanel
 from openpilot.system.hardware import PC
 from openpilot.system.hardware.hw import Paths
 from openpilot.system.ui.lib.application import gui_app
@@ -54,23 +55,30 @@ class DeveloperLayoutSP(DeveloperLayout):
 
     self.error_log_btn = button_item(tr("Error Log"), tr("VIEW"), tr("View the error log for sunnypilot crashes."), callback=self._on_error_log_clicked)
 
-    self.external_storage_btn = button_item(tr("External Storage"), tr("MANAGE"),
+    self.external_storage_btn = button_item(tr("External Storage (Beta)"), tr("MANAGE"),
                                             tr("Mount, unmount or format USB drives connected to the device. Formatting erases all data."),
                                             callback=self._on_external_storage_clicked)
 
-    self.tailscale_btn = button_item(tr("Tailscale"), tr("OPEN"),
+    self.tailscale_btn = button_item(tr("Tailscale (Beta)"), tr("OPEN"),
                                      tr("Connect this device to your Tailscale tailnet for remote access. " +
                                         "Scan the QR code to register the device."),
                                      callback=self._on_tailscale_clicked)
 
+    self.webdashcam_btn = button_item(tr("Dash Cam Web Server (Beta)"), tr("OPEN"),
+                                      tr("Browse and download dash cam clips from a phone or laptop on the same network."),
+                                      callback=self._on_webdashcam_clicked)
+
     self.items: list = [self.show_advanced_controls, self.enable_github_runner_toggle, self.enable_copyparty_toggle, self.prebuilt_toggle,
-                        self.error_log_btn, self.external_storage_btn, self.tailscale_btn,]
+                        self.error_log_btn, self.external_storage_btn, self.tailscale_btn, self.webdashcam_btn,]
 
   def _on_external_storage_clicked(self):
     gui_app.push_widget(ExternalStoragePanel())
 
   def _on_tailscale_clicked(self):
     gui_app.push_widget(TailscalePanel())
+
+  def _on_webdashcam_clicked(self):
+    gui_app.push_widget(WebDashcamPanel())
 
   @staticmethod
   def _on_prebuilt_toggled(state):

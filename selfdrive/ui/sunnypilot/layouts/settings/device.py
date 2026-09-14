@@ -7,12 +7,11 @@ See the LICENSE.md file in the root directory for more details.
 from openpilot.selfdrive.ui.layouts.settings.device import DeviceLayout
 from openpilot.selfdrive.ui.onroad.driver_camera_dialog import DriverCameraDialog
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.sunnypilot.webdashcam import config as webdashcam
 from openpilot.system.hardware import HARDWARE
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.widgets.list_view import option_item_sp, multiple_button_item_sp, button_item_sp, \
-  dual_button_item_sp, toggle_item_sp, Spacer
+  dual_button_item_sp, Spacer
 from openpilot.system.ui.widgets import DialogResult
 from openpilot.system.ui.widgets.button import ButtonStyle
 from openpilot.system.ui.widgets.confirm_dialog import alert_dialog, ConfirmDialog
@@ -159,21 +158,6 @@ class DeviceLayoutSP(DeviceLayout):
       inline=True,
     )
 
-    self._webdashcam_toggle = toggle_item_sp(
-      lambda: tr("Dash Cam Web Server"),
-      self._webdashcam_description,
-      initial_state=webdashcam.get_enabled(),
-      callback=self._on_webdashcam_toggle,
-    )
-    self._webdashcam_password = text_item(lambda: tr("Web Password"), lambda: webdashcam.get_password() or tr("(disabled)"))
-    self._webdashcam_address = text_item(lambda: tr("Web Address"), lambda: webdashcam.url() if webdashcam.get_enabled() else tr("(disabled)"))
-    self._webdashcam_regen = button_item_sp(
-      lambda: tr("Regenerate Web Password"),
-      lambda: tr("RESET"),
-      lambda: tr("Generate a new password. Devices already signed in will need the new one."),
-      callback=self._on_regen_web_password,
-    )
-
     self._quiet_mode_and_dcam = dual_button_item_sp(
       left_text=lambda: tr("Quiet Mode"),
       right_text=lambda: tr("Driver Camera Preview"),
@@ -229,11 +213,6 @@ class DeviceLayoutSP(DeviceLayout):
       LineSeparator(),
       self._max_time_offroad,
       LineSeparator(),
-      self._webdashcam_toggle,
-      self._webdashcam_password,
-      self._webdashcam_address,
-      self._webdashcam_regen,
-      LineSeparator(height=10),
       self._quiet_mode_and_dcam,
       self._reg_and_training,
       self._onroad_uploads_and_reset_settings,
@@ -254,25 +233,6 @@ class DeviceLayoutSP(DeviceLayout):
     header = tr("Controls state of the device after boot/sleep.")
 
     return f"{header}\n\n{def_str}\n{offrd_str}"
-
-  @staticmethod
-  def _webdashcam_description() -> str:
-    return tr("Browse and download dash cam clips from a phone or laptop on the same Wi-Fi.\n" +
-              "The server only runs while parked and requires the password shown below.")
-
-  @staticmethod
-  def _on_webdashcam_toggle(state: bool) -> None:
-    webdashcam.set_enabled(state)
-
-  @staticmethod
-  def _on_regen_web_password() -> None:
-    def _do(result: int):
-      if result == DialogResult.CONFIRM:
-        webdashcam.regenerate_password()
-
-    gui_app.push_widget(ConfirmDialog(
-      tr("Generate a new web password? Devices already signed in will need the new one."),
-      tr("Regenerate"), callback=_do))
 
   @staticmethod
   def _reset_settings():
