@@ -1,5 +1,6 @@
 import pyray as rl
 import numpy as np
+import json
 import time
 import threading
 from collections.abc import Callable
@@ -331,7 +332,6 @@ class Device(DeviceSP):
   def _apply_offroad_brightness(self, cur_brightness: float) -> float:
     try:
       with open("/data/community/offroad_brightness.json") as f:
-        import json
         cfg = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
       return cur_brightness
@@ -351,7 +351,6 @@ class Device(DeviceSP):
   def _reset_offroad_timer(self):
     try:
       with open("/data/community/offroad_brightness.json") as f:
-        import json
         cfg = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
       cfg = {}
