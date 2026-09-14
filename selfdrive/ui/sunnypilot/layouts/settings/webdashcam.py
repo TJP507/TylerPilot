@@ -59,13 +59,15 @@ class WebDashcamPanel(NavWidget):
     )
     self._password = text_item(lambda: tr("Web Password"), lambda: webdashcam.get_password() or tr("(disabled)"))
     self._address = text_item(lambda: tr("Web Address"), lambda: webdashcam.url() if webdashcam.get_enabled() else tr("(disabled)"))
+    self._address_lan = text_item(lambda: tr("Web Address (LAN)"), lambda: webdashcam.lan_url() or tr("(none)"))
+    self._address_lan.set_visible(self._show_lan_address)
     self._regen = button_item_sp(
       lambda: tr("Regenerate Web Password"),
       lambda: tr("RESET"),
       lambda: tr("Generate a new password. Devices already signed in will need the new one."),
       callback=self._on_regen,
     )
-    self._scroller = Scroller([self._toggle, self._password, self._address, self._regen],
+    self._scroller = Scroller([self._toggle, self._password, self._address, self._address_lan, self._regen],
                               spacing=0, line_separator=True, pad_end=True)
 
     global _TIMEOUT_CB_REGISTERED
@@ -95,12 +97,19 @@ class WebDashcamPanel(NavWidget):
 
   @staticmethod
   def _description() -> str:
-    return tr("Browse and download dash cam clips from a phone or laptop on the same Wi-Fi.\n" +
-              "The server only runs while parked and requires the password shown below.")
+    return tr("Browse and download dash cam clips from a phone or laptop on the same network " +
+              "(Wi-Fi or Tailscale).\nThe server only serves while parked (gear P) and requires the password shown below.")
 
   @staticmethod
   def _on_toggle(state: bool) -> None:
     webdashcam.set_enabled(state)
+
+  @staticmethod
+  def _show_lan_address() -> bool:
+    if not webdashcam.get_enabled():
+      return False
+    lan = webdashcam.lan_url()
+    return lan is not None and lan != webdashcam.url()
 
   @staticmethod
   def _on_regen() -> None:

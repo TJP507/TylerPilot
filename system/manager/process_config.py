@@ -187,8 +187,9 @@ procs += [
   # locationd
   NativeProcess("locationd_llk", "sunnypilot/selfdrive/locationd", ["./locationd"], only_onroad),
 
-  # web dash cam (password protected downloads over the local network, parked only)
-  PythonProcess("webdashcam", "sunnypilot.webdashcam.server", and_(only_offroad, use_webdashcam), enabled=not PC, restart_if_crash=True),
+  # web dash cam (password protected downloads; runs whenever enabled and refuses
+  # requests unless the car is parked, so it survives onroad/offroad transitions)
+  PythonProcess("webdashcam", "sunnypilot.webdashcam.server", use_webdashcam, enabled=not PC, restart_if_crash=True),
 
   # tailscale remote access (keeps the daemon alive and publishes status for the settings UI)
   PythonProcess("tailscale", "sunnypilot.tailscale.manager", always_run, enabled=not PC, restart_if_crash=True),

@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import json
 import os
 import secrets
 import socket
@@ -33,6 +32,9 @@ import zlib
 import psutil
 from aiohttp import web
 
+from cereal import car
+import cereal.messaging as messaging
+
 from openpilot.sunnypilot.webdashcam import config, library
 
 HOST = "0.0.0.0"
@@ -40,7 +42,6 @@ CHUNK = 1 << 20  # 1 MiB
 COOKIE = "wd_session"
 SESSION_TTL = 60 * 60 * 24 * 30
 _SESSION_MESSAGE = b"webdashcam-session-v1"
-TAILSCALE_STATUS_PATH = "/data/tailscale/status.json"
 
 # The server binds every interface, but a request is only served when it arrives
 # on one of these. Cellular data interfaces (rmnet*, wwan*, ppp*) are deliberately
@@ -122,6 +123,24 @@ def _request_allowed(request: web.Request) -> bool:
     _DENIED_SEEN.add(name)
     print(f"[webdashcam] refusing connection from interface {name}", flush=True)
   return False
+
+
+_SM = None
+
+
+def _is_parked() -> bool:
+  """True when the car is offroad, or onroad with the gear selector in Park.
+
+  The server now runs whenever it is enabled rather than only offroad, so it
+  must refuse to serve while the car is not parked.
+  """
+  global _SM
+  if _SM is None:
+    _SM = messaging.SubMaster(["carState", "deviceState"])
+  _SM.update(0)
+  if not _SM["deviceState"].started:
+    return True
+  return bool(_SM["carState"].valid) and _SM["carState"].gearShifter == car.CarState.GearShifter.park
 
 INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -339,6 +358,8 @@ def _login_html(error: str = "") -> str:
 async def auth_middleware(request: web.Request, handler):
   if not _request_allowed(request):
     return web.Response(status=403, text="Not available on this network.")
+  if not _is_parked():
+    return web.Response(status=403, text="Dash cam web server is only available while parked (gear P).")
   if request.path == "/favicon.ico":
     return web.Response(status=204)
   if request.path in ("/login", "/logout"):
@@ -550,82 +571,41 @@ class _ZipStream:
                                     central_size, central_offset, 0))
 
 
-def _wait_for_ip(timeout: float = 90.0) -> str:
-  """Wait for a routable address, since the server can start before Wi-Fi is up."""
+def _cert_sans() -> list[str]:
+  """SAN entries so the self-signed cert is valid on the LAN and over Tailscale."""
+  sans = ["IP:127.0.0.1", "DNS:localhost"]
+  for ip in config.lan_ips() + config.tailscale_ips():
+    entry = f"IP:{ip}"
+    if entry not in sans:
+      sans.append(entry)
+  for name in config.tailscale_names():
+    entry = f"DNS:{name}"
+    if entry not in sans:
+      sans.append(entry)
+  return sans
+
+
+def _wait_for_address(timeout: float = 45.0) -> None:
+  """Wait until a LAN or Tailscale address exists (the cert needs at least one)."""
   deadline = time.monotonic() + timeout
-  ip = config.local_ip()
-  while ip in ("0.0.0.0", "127.0.0.1") and time.monotonic() < deadline:
-    time.sleep(3)
-    ip = config.local_ip()
-  return ip
-
-
-def _tailscale_sans() -> list[str]:
-  """SAN entries for the device's Tailscale identity.
-
-  Without these the self-signed certificate is only valid for the LAN address,
-  so reaching the UI over the tailnet (bare IP or MagicDNS name) fails with a
-  hostname mismatch that many browsers refuse to bypass.
-  """
-  names: list[str] = []
-  try:
-    for iface, addrs in psutil.net_if_addrs().items():
-      if not iface.startswith("tailscale"):
-        continue
-      for addr in addrs:
-        if addr.family == socket.AF_INET:
-          names.append(f"IP:{addr.address}")
-        elif addr.family == socket.AF_INET6:
-          names.append(f"IP:{addr.address.split('%')[0]}")
-  except Exception:
-    pass
-  try:
-    with open(TAILSCALE_STATUS_PATH) as f:
-      data = json.load(f)
-    host = str(data.get("hostname") or "").strip()
-    dns = str(data.get("dns_name") or "").strip().rstrip(".")
-    if host:
-      names.append(f"DNS:{host}")
-    if dns:
-      names.append(f"DNS:{dns}")
-  except (OSError, ValueError):
-    pass
-  return names
-
-
-def _tailscale_active() -> bool:
-  try:
-    with open(TAILSCALE_STATUS_PATH) as f:
-      data = json.load(f)
-    return bool(data.get("enabled")) and bool(data.get("daemon"))
-  except (OSError, ValueError):
-    return False
-
-
-def _wait_for_tailscale_sans(timeout: float = 30.0) -> list[str]:
-  """Wait briefly for Tailscale's address, but only when it is actually running."""
-  if not _tailscale_active():
-    return _tailscale_sans()
-  deadline = time.monotonic() + timeout
-  names = _tailscale_sans()
-  while not any(name.startswith("IP:") for name in names) and time.monotonic() < deadline:
+  while not (config.lan_ips() or config.tailscale_ips()) and time.monotonic() < deadline:
     time.sleep(2)
-    names = _tailscale_sans()
-  return names
 
 
 def _ensure_cert() -> tuple[str, str]:
   """Return (cert, key), generating a self-signed pair for the current addresses if needed.
 
-  The certificate carries the device's current LAN address and Tailscale
-  identity as SANs so HTTPS works against both. It is regenerated whenever
-  either changes, which is the only way to avoid a hostname mismatch, at the
-  cost of re-accepting the self-signed warning.
+  SANs cover the LAN address(es) and the Tailscale IP / MagicDNS name so HTTPS
+  works no matter which one is used. The cellular address is deliberately
+  excluded: it changes constantly and is not reachable from the LAN or tailnet.
+  The certificate is regenerated whenever the set of addresses changes, which is
+  the only way to avoid a hostname mismatch, at the cost of re-accepting the
+  self-signed warning.
   """
   cert, key = config.CERT_PATH, config.KEY_PATH
-  ip = _wait_for_ip()
-  ts_sans = _wait_for_tailscale_sans()
-  signature = "|".join([ip, *ts_sans])
+  _wait_for_address()
+  sans = _cert_sans()
+  signature = "|".join(sans)
   marker = cert + ".ip"
   try:
     with open(marker) as f:
@@ -636,11 +616,10 @@ def _ensure_cert() -> tuple[str, str]:
   if os.path.exists(cert) and os.path.exists(key) and previous == signature:
     return cert, key
 
-  san = ",".join([f"IP:{ip}", "IP:127.0.0.1", "DNS:localhost", *ts_sans])
   subprocess.run(
     ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
      "-keyout", key, "-out", cert, "-days", "3650",
-     "-subj", "/CN=webdashcam", "-addext", f"subjectAltName={san}"],
+     "-subj", "/CN=webdashcam", "-addext", f"subjectAltName={','.join(sans)}"],
     check=True, capture_output=True)
   os.chmod(key, 0o600)
   with open(marker, "w") as f:
