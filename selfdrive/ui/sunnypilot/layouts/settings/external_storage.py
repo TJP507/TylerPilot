@@ -296,6 +296,11 @@ def format_whole_drive(disk: str) -> tuple:
   return r.returncode == 0, (r.stderr or r.stdout).strip()
 
 
+def _fs_type(dev: str) -> str:
+  r = _run(["sudo", "blkid", "-o", "value", "-s", "TYPE", dev])
+  return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def mount_partition(entry: dict) -> tuple:
   if not _is_external_path(entry["path"]):
     return False, "refusing to mount non-external device"
@@ -304,8 +309,22 @@ def mount_partition(entry: dict) -> tuple:
     os.makedirs(mnt, exist_ok=True)
   except OSError as e:
     return False, str(e)
-  r = _run(["sudo", "mount", entry["path"], mnt])
-  return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+  # The UI process (user "comma") must be able to write to the mount, otherwise
+  # exports fail with permission errors. FAT has no on-disk ownership, so map it
+  # via mount options; real filesystems get chowned after mounting.
+  uid, gid = os.getuid(), os.getgid()
+  fstype = _fs_type(entry["path"]).lower()
+  opts = ["nodev", "nosuid"]
+  if fstype in ("vfat", "msdos", "exfat"):
+    opts += [f"uid={uid}", f"gid={gid}", "umask=000"]
+
+  r = _run(["sudo", "mount", "-o", ",".join(opts), entry["path"], mnt])
+  if r.returncode != 0:
+    return False, (r.stderr or r.stdout).strip()
+  if fstype not in ("vfat", "msdos", "exfat"):
+    _run(["sudo", "chown", f"{uid}:{gid}", mnt])
+  return True, ""
 
 
 def unmount_partition(entry: dict) -> tuple:

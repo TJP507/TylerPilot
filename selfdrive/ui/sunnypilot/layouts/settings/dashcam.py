@@ -215,16 +215,16 @@ def segment_cameras(seg_dir: str) -> list:
 
 
 def _remux_one(src: str, dst: str) -> tuple:
-  """Stream-copy src to an mp4 at dst via ffmpeg. Returns (ok, cancelled)."""
+  """Stream-copy src to an mp4 at dst via ffmpeg. Returns (ok, cancelled, error)."""
   cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-y"]
   if not src.endswith(".ts"):
     # Raw HEVC carries no container timestamps; generate them at the record rate.
     cmd += ["-fflags", "+genpts", "-r", str(int(PLAYER_FPS))]
   cmd += ["-i", src, "-c", "copy", dst]
   try:
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
-  except OSError:
-    return False, False
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+  except OSError as e:
+    return False, False, str(e)
 
   cancelled = False
   if proc.stdout is not None:
@@ -243,14 +243,20 @@ def _remux_one(src: str, dst: str) -> tuple:
           proc.terminate()
       elif line.startswith("progress=end"):
         break
+  err = ""
   proc.wait()
   if cancelled or proc.returncode != 0:
+    if proc.stderr is not None:
+      try:
+        err = proc.stderr.read().strip()
+      except Exception:
+        err = ""
     try:
       os.remove(dst)
     except OSError:
       pass
-    return False, cancelled
-  return True, False
+    return False, cancelled, err
+  return True, False, ""
 
 
 def _run_export(segments: list, mountpoint: str) -> None:
@@ -269,6 +275,7 @@ def _run_export(segments: list, mountpoint: str) -> None:
   done = 0
   errors = 0
   cancelled = False
+  last_error = ""
   for _seg_dir, mtime, cams in plan:
     date = time.strftime("%Y-%m-%d", time.localtime(mtime))
     stamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(mtime))
@@ -278,21 +285,23 @@ def _run_export(segments: list, mountpoint: str) -> None:
       out_dir = os.path.join(mountpoint, EXPORT_DIR_NAME, date, folder)
       try:
         os.makedirs(out_dir, exist_ok=True)
-      except OSError:
+      except OSError as e:
         errors += 1
         done += 1
+        last_error = str(e)
         continue
       dst = os.path.join(out_dir, f"{stamp}_{folder}.mp4")
       with _EXPORT_LOCK:
         _EXPORT["current"] = os.path.basename(dst)
         _EXPORT["fraction"] = 0.0
-      ok, was_cancelled = _remux_one(src, dst)
+      ok, was_cancelled, err = _remux_one(src, dst)
       if was_cancelled:
         cancelled = True
       else:
         done += 1
         if not ok:
           errors += 1
+          last_error = err or last_error
       with _EXPORT_LOCK:
         _EXPORT["done"] = done
         _EXPORT["fraction"] = 0.0
@@ -303,7 +312,8 @@ def _run_export(segments: list, mountpoint: str) -> None:
   if cancelled:
     result = tr("Cancelled") + f". {done}/{total} " + tr("file(s) exported to") + f" {root}"
   elif errors:
-    result = f"{done - errors} " + tr("exported,") + f" {errors} " + tr("failed") + f" -> {root}"
+    reason = f": {last_error[:100]}" if last_error else ""
+    result = f"{done - errors} " + tr("exported,") + f" {errors} " + tr("failed") + reason + f" -> {root}"
   else:
     result = f"{done} " + tr("file(s) exported to") + f" {root}"
   with _EXPORT_LOCK:
@@ -1200,8 +1210,10 @@ class _DateRow(Widget):
     return rl.Rectangle(rect.x + rect.width - self.EXPORT_W - 40, rect.y + (rect.height - 92) / 2, self.EXPORT_W, 92)
 
   def _handle_mouse_release(self, mouse_pos) -> None:
-    if self._can_export and rl.check_collision_point_rec(mouse_pos, self._export_rect(self._rect)):
-      self._on_export()
+    if rl.check_collision_point_rec(mouse_pos, self._export_rect(self._rect)):
+      if self._can_export:
+        self._on_export()
+      # A disabled Export button must not fall through to opening the folder.
     else:
       self._on_open()
 
@@ -1428,8 +1440,10 @@ class DashCamLayout(Widget):
       self._btn_export.set_enabled(can_export and bool(self._selected) and not export_active())
       self._btn_export.render(rl.Rectangle(rect.x + rect.width - 320, ctrl_y, 320, 84))
     else:
-      hint = tr("Select a date to view or export its clips")
-      rl.draw_text_ex(self._small, hint, rl.Vector2(rect.x, ctrl_y + 26), 34, 0, SUBTEXT_COLOR)
+      if not can_export:
+        rl.draw_text_ex(self._small, tr("No USB drive mounted"), rl.Vector2(rect.x, ctrl_y + 26), 34, 0, rl.Color(255, 180, 120, 255))
+      else:
+        rl.draw_text_ex(self._small, tr("Select a date to view or export its clips"), rl.Vector2(rect.x, ctrl_y + 26), 34, 0, SUBTEXT_COLOR)
 
     list_y = ctrl_y + 84 + 22
     list_rect = rl.Rectangle(rect.x, list_y, rect.width, rect.height - (list_y - rect.y))
