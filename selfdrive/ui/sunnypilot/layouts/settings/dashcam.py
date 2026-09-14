@@ -754,7 +754,7 @@ class DashCamPlayer(NavWidget):
 
     if self._clips:
       clip = self._clips[self._index]
-      title = f"{self._camera_file}  ·  {clip.date_text}  {clip.time_text}"
+      title = f"{clip.date_text}   {clip.time_text}   -   segment {clip.segment}"
       rl.draw_text_ex(self._font, title, rl.Vector2(rect.x + 40, rect.y + 30), 40, 0, rl.WHITE)
 
     if self._error:
@@ -789,7 +789,7 @@ class _ClipRow(Widget):
     bg = ROW_BG_PRESSED if self.is_pressed else ROW_BG
     rl.draw_rectangle_rounded(rect, 0.15, 8, bg)
     rl.draw_text_ex(self._font, self._clip.date_text, rl.Vector2(rect.x + 40, rect.y + 28), 46, 0, rl.WHITE)
-    subtitle = f"{self._clip.time_text}   ·   segment {self._clip.segment}"
+    subtitle = f"{self._clip.time_text}   -   segment {self._clip.segment}"
     rl.draw_text_ex(self._small_font, subtitle, rl.Vector2(rect.x + 40, rect.y + 88), 34, 0, SUBTEXT_COLOR)
 
 
