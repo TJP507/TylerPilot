@@ -69,6 +69,19 @@ def operation_status() -> dict:
     return dict(_OP)
 
 
+def clear_operation_result() -> None:
+  """Drop the status line from a finished operation (panel reopened, rescanned, or a drive removed)."""
+  with _OP_LOCK:
+    if _OP["active"]:
+      return
+    _OP["title"] = ""
+    _OP["label"] = ""
+    _OP["result"] = ""
+    _OP["failed"] = False
+    _OP["progress"] = 0.0
+    _OP["revision"] += 1
+
+
 def _set_progress(value: float) -> None:
   with _OP_LOCK:
     _OP["progress"] = max(0.0, min(1.0, value))
@@ -619,6 +632,7 @@ class ExternalStoragePanel(NavWidget):
       _ACTIVE_PANEL = None
 
   def _rescan(self) -> None:
+    clear_operation_result()
     request_refresh()
     self._sync_rows()
 
@@ -626,6 +640,8 @@ class ExternalStoragePanel(NavWidget):
     """Rebuild the rows from the cached snapshot. Never enumerates on this thread."""
     revision, entries = external_entries()
     if [disk for disk, _size, _entry in entries] != [row._disk for row in self._rows]:
+      # Drives came or went: any previous mount/unmount message is now stale.
+      clear_operation_result()
       self._rows = [_DriveRow(disk, size, entry, self) for disk, size, entry in entries]
       self._scroller = Scroller(self._rows, spacing=16, line_separator=False, pad_end=True)
       self._scroller.show_event()
