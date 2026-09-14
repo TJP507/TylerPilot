@@ -1157,7 +1157,7 @@ class _ClipRow(Widget):
       self._selected = not self._selected
       self._on_toggle(self._clip, self._selected)
     else:
-      self._on_open()
+      self._on_open(self._clip)
 
   def _render(self, rect: rl.Rectangle) -> None:
     bg = ROW_BG_PRESSED if self.is_pressed else ROW_BG
