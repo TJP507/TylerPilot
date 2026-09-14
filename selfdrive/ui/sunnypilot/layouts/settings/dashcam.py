@@ -386,6 +386,7 @@ class _HardwareDecoder(threading.Thread):
     self._img_w = 0
     self._img_h = 0
     self._files: list = []
+    self._prefix = b""
 
   # ---- thread control (called from UI thread) ----
   def stop(self) -> None:
@@ -444,6 +445,16 @@ class _HardwareDecoder(threading.Thread):
       fed_count = 0
       try:
         with open(self._path, "rb") as fh:
+          # HEVC parameter sets (VPS/SPS/PPS) only appear once, at the top of the
+          # file. A session that starts mid-file must re-send them before the
+          # first IDR, otherwise msm_vidc emits blank frames.
+          if start_idx > 0 and self._prefix:
+            try:
+              proc.stdin.write(struct.pack("<I", len(self._prefix)))
+              proc.stdin.write(self._prefix)
+              proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+              return
           while i < len(frames) and not self._stop_ev.is_set():
             with self._lock:
               if self._seek_to is not None:
@@ -577,6 +588,7 @@ class _HardwareDecoder(threading.Thread):
       self._files = packets
       with self._lock:
         self._total = len(packets)
+      self._prefix = self._extract_param_sets(self._path)
     except Exception as e:
       with self._lock:
         self._error = str(e) or type(e).__name__
@@ -604,6 +616,25 @@ class _HardwareDecoder(threading.Thread):
         time.sleep(0.05)
       with self._lock:
         self._eof = False
+
+  @staticmethod
+  def _extract_param_sets(path: str) -> bytes:
+    """Return the leading VPS/SPS/PPS bytes (everything before the first VCL NAL)."""
+    try:
+      with open(path, "rb") as fh:
+        raw = fh.read(1 << 20)
+    except OSError:
+      return b""
+    i, n = 0, len(raw)
+    while i < n - 4:
+      if raw[i] == 0 and raw[i + 1] == 0 and (raw[i + 2] == 1 or (raw[i + 2] == 0 and raw[i + 3] == 1)):
+        sc = 4 if raw[i + 2] == 0 else 3
+        if i + sc < n and ((raw[i + sc] >> 1) & 0x3F) <= 31:
+          return raw[:i]
+        i += sc
+      else:
+        i += 1
+    return b""
 
   def _snap_to_gop(self, frame_idx: int) -> int:
     keyframes = [i for i, (is_key, _, _) in enumerate(self._files) if is_key]
