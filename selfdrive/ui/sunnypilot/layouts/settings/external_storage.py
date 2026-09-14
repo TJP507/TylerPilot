@@ -15,6 +15,7 @@ external, and every write action goes through sudo.
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -109,7 +110,7 @@ _AUTOMOUNT_STARTED = False
 # seconds, so it must never run on the UI thread. A background loop keeps this
 # snapshot fresh; the UI only ever reads it.
 _SNAPSHOT_LOCK = threading.Lock()
-_SNAPSHOT: dict = {"entries": [], "first_mounted": None, "revision": 0}
+_SNAPSHOT: dict = {"entries": [], "first_mounted": None, "external_usage": None, "revision": 0}
 _REFRESHING = threading.Event()
 REFRESH_INTERVAL = 3.0
 
@@ -131,9 +132,18 @@ def _collect() -> tuple:
 def refresh_external() -> None:
   """Re-enumerate and publish a new snapshot. Blocking: background threads only."""
   entries, first_mounted = _collect()
+  usage = None
+  if first_mounted and first_mounted.get("mountpoint"):
+    # statvfs on the mount can block while a just-plugged drive is settling, so
+    # it is done here, off the UI thread, and only the result is published.
+    try:
+      du = shutil.disk_usage(first_mounted["mountpoint"])
+      usage = {"mountpoint": first_mounted["mountpoint"], "used": du.used, "free": du.free}
+    except OSError:
+      usage = None
   with _SNAPSHOT_LOCK:
     _SNAPSHOT.update(entries=entries, first_mounted=first_mounted,
-                     revision=_SNAPSHOT["revision"] + 1)
+                     external_usage=usage, revision=_SNAPSHOT["revision"] + 1)
 
 
 def request_refresh() -> None:
@@ -162,6 +172,12 @@ def external_entries() -> tuple:
 def external_revision() -> int:
   with _SNAPSHOT_LOCK:
     return _SNAPSHOT["revision"]
+
+
+def external_storage_usage():
+  """Cached {mountpoint, used, free} of the first mounted drive, or None. Never blocks."""
+  with _SNAPSHOT_LOCK:
+    return _SNAPSHOT["external_usage"]
 
 
 def _automount_loop() -> None:
@@ -470,7 +486,7 @@ class _DriveRow(Widget):
     e = self._entry
     rl.draw_rectangle_rounded(rect, 0.08, 8, rl.Color(58, 40, 40, 255))
 
-    mounted = bool(e["mountpoint"]) or os.path.ismount(os.path.join(MOUNT_ROOT, self._disk))
+    mounted = bool(e["mountpoint"])
     fstype = (e.get("fstype") or "").lower()
     mountable = fstype in MOUNTABLE_FS
     title = f"/dev/{self._disk}   {_human_size(self._size)}"
@@ -602,7 +618,7 @@ class ExternalStoragePanel(NavWidget):
   def toggle_mount(self, entry: dict) -> None:
     if operation_active():
       return
-    mounted = bool(entry["mountpoint"]) or os.path.ismount(os.path.join(MOUNT_ROOT, entry["name"]))
+    mounted = bool(entry["mountpoint"])
     if not mounted and (entry.get("fstype") or "").lower() not in MOUNTABLE_FS:
       return
     if mounted:

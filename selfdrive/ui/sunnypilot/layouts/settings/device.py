@@ -82,10 +82,11 @@ def _storage_usage(path: str) -> str:
 
 
 def _external_storage_usage() -> str:
-  from openpilot.selfdrive.ui.sunnypilot.layouts.settings.external_storage import first_mounted_external
-  entry = first_mounted_external()
-  mountpoint = entry.get("mountpoint") if entry else None
-  return _storage_usage(mountpoint) if mountpoint else tr("Not mounted")
+  from openpilot.selfdrive.ui.sunnypilot.layouts.settings.external_storage import external_storage_usage
+  usage = external_storage_usage()
+  if not usage:
+    return tr("Not mounted")
+  return f"{_fmt_bytes(usage['used'])} {tr('used')} / {_fmt_bytes(usage['free'])} {tr('free')}"
 
 
 def _memory_usage() -> str:
