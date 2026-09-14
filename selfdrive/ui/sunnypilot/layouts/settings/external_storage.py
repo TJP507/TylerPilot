@@ -59,6 +59,10 @@ def operation_active() -> bool:
     return _OP["active"]
 
 
+# Keep the screen awake while a mount/unmount/format is running, even if the panel was dismissed.
+device.add_keep_awake_callback(operation_active)
+
+
 def operation_status() -> dict:
   with _OP_LOCK:
     return dict(_OP)

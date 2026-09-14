@@ -193,6 +193,10 @@ def export_active() -> bool:
     return _EXPORT["active"]
 
 
+# Keep the screen awake while an export is running, even if the dialog was dismissed.
+device.add_keep_awake_callback(export_active)
+
+
 def request_export_cancel() -> None:
   with _EXPORT_LOCK:
     _EXPORT["cancel"] = True
