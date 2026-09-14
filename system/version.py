@@ -107,6 +107,7 @@ class OpenpilotMetadata:
                                           "github.com/sunnypilot/openpilot",
                                           "github.com/sunnyhaibin/sunnypilot",
                                           "github.com/sunnyhaibin/openpilot",
+                                          "github.com/TJP507/openpilot",
                                           "github.com/TJP507/TylerPilot")
 
   @property
