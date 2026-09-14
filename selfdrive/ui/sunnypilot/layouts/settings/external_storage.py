@@ -51,7 +51,7 @@ GOOD_COLOR = rl.Color(140, 220, 140, 255)
 # Operation state lives at module scope so it survives the panel being closed
 # and reopened while a format/mount is still running in the background.
 _OP_LOCK = threading.Lock()
-_OP: dict = {"active": False, "label": "", "result": "", "failed": False, "revision": 0}
+_OP: dict = {"active": False, "title": "", "label": "", "result": "", "failed": False, "progress": 0.0, "revision": 0}
 
 
 def operation_active() -> bool:
@@ -59,9 +59,14 @@ def operation_active() -> bool:
     return _OP["active"]
 
 
-def operation_status() -> tuple:
+def operation_status() -> dict:
   with _OP_LOCK:
-    return _OP["active"], _OP["label"], _OP["result"], _OP["failed"], _OP["revision"]
+    return dict(_OP)
+
+
+def _set_progress(value: float) -> None:
+  with _OP_LOCK:
+    _OP["progress"] = max(0.0, min(1.0, value))
 
 
 def _draw_spinner(cx: float, cy: float, radius: float, color: rl.Color) -> None:
@@ -272,6 +277,7 @@ def format_whole_drive(disk: str) -> tuple:
     return False, "refusing to format non-external device"
 
   # Release every partition on the disk (mounts and swap) before repartitioning.
+  _set_progress(0.05)
   parts = [e["name"] for e in _disk_entries(disk) if not e.get("is_disk")]
   for part in parts:
     _run(["sudo", "umount", f"/dev/{part}"])
@@ -279,14 +285,18 @@ def format_whole_drive(disk: str) -> tuple:
   _run(["sudo", "umount", path])
   _run(["sudo", "swapoff", path])
 
+  _set_progress(0.15)
   if _run(["sudo", "wipefs", "-a", path], timeout=60).returncode != 0:
     return False, "wipefs failed"
+  _set_progress(0.3)
   if _run(["sudo", "parted", "-s", path, "mklabel", "gpt"], timeout=60).returncode != 0:
     return False, "mklabel failed"
+  _set_progress(0.45)
   r = _run(["sudo", "parted", "-s", "-a", "optimal", path, "mkpart", "primary", "fat32", "1MiB", "100%"], timeout=120)
   if r.returncode != 0:
     return False, (r.stderr or r.stdout).strip()
 
+  _set_progress(0.65)
   _run(["sudo", "partprobe", path], timeout=30)
   new_part = _partition_name(disk, 1)
   for _ in range(24):
@@ -296,7 +306,9 @@ def format_whole_drive(disk: str) -> tuple:
   if not os.path.exists(new_part):
     return False, "new partition did not appear"
 
+  _set_progress(0.85)
   r = _run(["sudo", "mkfs.vfat", "-F", "32", "-n", FORMAT_LABEL, new_part], timeout=300)
+  _set_progress(1.0)
   return r.returncode == 0, (r.stderr or r.stdout).strip()
 
 
@@ -416,10 +428,58 @@ class _DriveRow(Widget):
     x = rect.x + rect.width - total_w - 40
     y = rect.y + (rect.height - self.BTN_H) / 2
     for btn in (self._btn_toggle, self._btn_fat):
-      # Mount stays disabled until the drive has a filesystem we can actually mount.
-      btn.set_enabled(not busy and (mounted or mountable or btn is self._btn_fat))
+      if btn is self._btn_fat:
+        # Formatting only makes sense on an unmounted drive.
+        btn.set_enabled(not busy and not mounted)
+      else:
+        # Mount stays disabled until the drive has a filesystem we can actually mount.
+        btn.set_enabled(not busy and (mounted or mountable))
       btn.render(rl.Rectangle(x, y, self.BTN_W, self.BTN_H))
       x += self.BTN_W + self.GAP
+
+
+def _draw_progress_bar(rect: rl.Rectangle, frac: float, indeterminate: bool) -> None:
+  rl.draw_rectangle_rounded(rect, 0.5, 8, rl.Color(60, 60, 60, 255))
+  fill = rl.Color(80, 160, 255, 255)
+  if indeterminate:
+    seg = rect.width * 0.3
+    span = rect.width - seg
+    x = rect.x + span * ((rl.get_time() * 0.6) % 1.0)
+    rl.draw_rectangle_rounded(rl.Rectangle(x, rect.y, seg, rect.height), 0.5, 8, fill)
+  elif frac > 0:
+    rl.draw_rectangle_rounded(rl.Rectangle(rect.x, rect.y, rect.width * frac, rect.height), 0.5, 8, fill)
+
+
+class StorageProgressDialog(NavWidget):
+  """Modal progress dialog shown while mounting or formatting a drive."""
+
+  def __init__(self):
+    super().__init__()
+    self._font = gui_app.font(FontWeight.MEDIUM)
+    self._small = gui_app.font(FontWeight.NORMAL)
+    self._btn_close = self._child(Button(tr("Close"), lambda: self.dismiss(), font_size=44, button_style=ButtonStyle.PRIMARY))
+
+  def _back_enabled(self) -> bool:
+    return False
+
+  def _render(self, rect: rl.Rectangle) -> None:
+    status = operation_status()
+    active = status["active"]
+    rl.draw_rectangle_rec(rect, rl.Color(21, 21, 21, 255))
+
+    title = status["title"] or tr("Working")
+    rl.draw_text_ex(self._font, title, rl.Vector2(rect.x + 60, rect.y + 60), 56, 0, TEXT_COLOR)
+
+    bar = rl.Rectangle(rect.x + 60, rect.y + 210, rect.width - 120, 46)
+    _draw_progress_bar(bar, status["progress"], indeterminate=(active and status["progress"] <= 0.0))
+
+    label = status["label"] if active else status["result"]
+    color = WARN_COLOR if active else (rl.RED if status["failed"] else GOOD_COLOR)
+    if label:
+      rl.draw_text_ex(self._small, label, rl.Vector2(bar.x, bar.y + bar.height + 24), 36, 0, color)
+
+    if not active:
+      self._btn_close.render(rl.Rectangle(rect.x + rect.width - 60 - 300, rect.y + rect.height - 160, 300, 110))
 
 
 class ExternalStoragePanel(NavWidget):
@@ -432,7 +492,7 @@ class ExternalStoragePanel(NavWidget):
     self._scroller = Scroller([], spacing=16, line_separator=False, pad_end=True)
     self._rows: list = []
     self._reload_pending = False
-    self._seen_revision = operation_status()[4]
+    self._seen_revision = operation_status()["revision"]
     self._btn_back = self._child(Button(tr("Back"), lambda: self.dismiss(), font_size=40))
     self._btn_rescan = self._child(Button(tr("Rescan"), self._reload, font_size=40))
 
@@ -466,7 +526,7 @@ class ExternalStoragePanel(NavWidget):
     self._scroller = Scroller(rows, spacing=16, line_separator=False, pad_end=True)
     self._scroller.show_event()
     self._rows = rows
-    self._seen_revision = operation_status()[4]
+    self._seen_revision = operation_status()["revision"]
 
   # ---- actions ----
   def toggle_mount(self, entry: dict) -> None:
@@ -476,9 +536,11 @@ class ExternalStoragePanel(NavWidget):
     if not mounted and (entry.get("fstype") or "").lower() not in MOUNTABLE_FS:
       return
     if mounted:
-      self._run_action(unmount_partition, entry, tr("Unmounting") + f" {entry['path']}", tr("Unmounted") + f" {entry['path']}")
+      self._run_action(unmount_partition, entry, tr("Unmounting") + f" {entry['path']}",
+                       tr("Unmounted") + f" {entry['path']}", tr("Unmounting drive"))
     else:
-      self._run_action(mount_partition, entry, tr("Mounting") + f" {entry['path']}", tr("Mounted") + f" {entry['path']}")
+      self._run_action(mount_partition, entry, tr("Mounting") + f" {entry['path']}",
+                       tr("Mounted") + f" {entry['path']}", tr("Mounting drive"))
 
   def confirm_format_drive(self, disk: str) -> None:
     if operation_active():
@@ -486,19 +548,22 @@ class ExternalStoragePanel(NavWidget):
 
     def cb(result: int):
       if result == DialogResult.CONFIRM:
-        self._run_action(format_whole_drive, disk, tr("Erasing") + f" /dev/{disk}", tr("Erased") + f" /dev/{disk}")
+        self._run_action(format_whole_drive, disk, tr("Erasing") + f" /dev/{disk}",
+                         tr("Erased") + f" /dev/{disk}", tr("Erasing storage"))
 
     msg = tr("Are you sure you want to delete all of the data on this device?")
     gui_app.push_widget(ConfirmDialog(msg, tr("Erase Storage"), callback=cb, confirm_style=ButtonStyle.DANGER))
 
-  def _run_action(self, fn, arg, start_label: str, done_label: str, *args) -> None:
+  def _run_action(self, fn, arg, start_label: str, done_label: str, title: str, *args) -> None:
     with _OP_LOCK:
       if _OP["active"]:
         return
       _OP["active"] = True
+      _OP["title"] = title
       _OP["label"] = start_label + "..."
       _OP["result"] = ""
       _OP["failed"] = False
+      _OP["progress"] = 0.0
       self._seen_revision = _OP["revision"]
 
     def worker():
@@ -508,16 +573,18 @@ class ExternalStoragePanel(NavWidget):
         ok, err = False, str(e)
       with _OP_LOCK:
         _OP["active"] = False
+        _OP["progress"] = 1.0
         _OP["result"] = done_label if ok else f"{tr('Failed')}: {err or 'unknown error'}"
         _OP["failed"] = not ok
         _OP["revision"] += 1
 
     threading.Thread(target=worker, daemon=True).start()
+    gui_app.push_widget(StorageProgressDialog())
 
   # ---- render ----
   def _update_state(self) -> None:
     super()._update_state()
-    if operation_status()[4] != self._seen_revision:
+    if operation_status()["revision"] != self._seen_revision:
       self._reload_pending = True
     if self._reload_pending and not operation_active():
       self._reload_pending = False
@@ -532,7 +599,8 @@ class ExternalStoragePanel(NavWidget):
     self._btn_rescan.render(rl.Rectangle(rect.x + rect.width - 240, rect.y, 240, 84))
     rl.draw_text_ex(self._font, tr("External Storage"), rl.Vector2(rect.x + 240, rect.y + 8), 56, 0, TEXT_COLOR)
 
-    active, label, result, failed, _ = operation_status()
+    status = operation_status()
+    active, label, result, failed = status["active"], status["label"], status["result"], status["failed"]
     line = label if active else result
     if line:
       color = WARN_COLOR if active else (rl.RED if failed else GOOD_COLOR)
