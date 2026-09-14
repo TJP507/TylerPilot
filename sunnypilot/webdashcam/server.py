@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import socket
@@ -39,6 +40,7 @@ CHUNK = 1 << 20  # 1 MiB
 COOKIE = "wd_session"
 SESSION_TTL = 60 * 60 * 24 * 30
 _SESSION_MESSAGE = b"webdashcam-session-v1"
+TAILSCALE_STATUS_PATH = "/data/tailscale/status.json"
 
 # The server binds every interface, but a request is only served when it arrives
 # on one of these. Cellular data interfaces (rmnet*, wwan*, ppp*) are deliberately
@@ -558,27 +560,83 @@ def _wait_for_ip(timeout: float = 90.0) -> str:
   return ip
 
 
-def _ensure_cert() -> tuple[str, str]:
-  """Return (cert, key), generating a self-signed pair for the current IP if needed.
+def _tailscale_sans() -> list[str]:
+  """SAN entries for the device's Tailscale identity.
 
-  The certificate carries the device's current address as a SAN so HTTPS works
-  against the bare IP. It is regenerated whenever that address changes, which is
-  the only way to avoid a hostname mismatch, at the cost of re-accepting the
-  self-signed warning.
+  Without these the self-signed certificate is only valid for the LAN address,
+  so reaching the UI over the tailnet (bare IP or MagicDNS name) fails with a
+  hostname mismatch that many browsers refuse to bypass.
+  """
+  names: list[str] = []
+  try:
+    for iface, addrs in psutil.net_if_addrs().items():
+      if not iface.startswith("tailscale"):
+        continue
+      for addr in addrs:
+        if addr.family == socket.AF_INET:
+          names.append(f"IP:{addr.address}")
+        elif addr.family == socket.AF_INET6:
+          names.append(f"IP:{addr.address.split('%')[0]}")
+  except Exception:
+    pass
+  try:
+    with open(TAILSCALE_STATUS_PATH) as f:
+      data = json.load(f)
+    host = str(data.get("hostname") or "").strip()
+    dns = str(data.get("dns_name") or "").strip().rstrip(".")
+    if host:
+      names.append(f"DNS:{host}")
+    if dns:
+      names.append(f"DNS:{dns}")
+  except (OSError, ValueError):
+    pass
+  return names
+
+
+def _tailscale_active() -> bool:
+  try:
+    with open(TAILSCALE_STATUS_PATH) as f:
+      data = json.load(f)
+    return bool(data.get("enabled")) and bool(data.get("daemon"))
+  except (OSError, ValueError):
+    return False
+
+
+def _wait_for_tailscale_sans(timeout: float = 30.0) -> list[str]:
+  """Wait briefly for Tailscale's address, but only when it is actually running."""
+  if not _tailscale_active():
+    return _tailscale_sans()
+  deadline = time.monotonic() + timeout
+  names = _tailscale_sans()
+  while not any(name.startswith("IP:") for name in names) and time.monotonic() < deadline:
+    time.sleep(2)
+    names = _tailscale_sans()
+  return names
+
+
+def _ensure_cert() -> tuple[str, str]:
+  """Return (cert, key), generating a self-signed pair for the current addresses if needed.
+
+  The certificate carries the device's current LAN address and Tailscale
+  identity as SANs so HTTPS works against both. It is regenerated whenever
+  either changes, which is the only way to avoid a hostname mismatch, at the
+  cost of re-accepting the self-signed warning.
   """
   cert, key = config.CERT_PATH, config.KEY_PATH
   ip = _wait_for_ip()
+  ts_sans = _wait_for_tailscale_sans()
+  signature = "|".join([ip, *ts_sans])
   marker = cert + ".ip"
   try:
     with open(marker) as f:
-      previous_ip = f.read().strip()
+      previous = f.read().strip()
   except OSError:
-    previous_ip = ""
+    previous = ""
 
-  if os.path.exists(cert) and os.path.exists(key) and previous_ip == ip:
+  if os.path.exists(cert) and os.path.exists(key) and previous == signature:
     return cert, key
 
-  san = f"IP:{ip},IP:127.0.0.1,DNS:localhost"
+  san = ",".join([f"IP:{ip}", "IP:127.0.0.1", "DNS:localhost", *ts_sans])
   subprocess.run(
     ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
      "-keyout", key, "-out", cert, "-days", "3650",
@@ -586,7 +644,7 @@ def _ensure_cert() -> tuple[str, str]:
     check=True, capture_output=True)
   os.chmod(key, 0o600)
   with open(marker, "w") as f:
-    f.write(ip)
+    f.write(signature)
   return cert, key
 
 
