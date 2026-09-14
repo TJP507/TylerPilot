@@ -23,6 +23,7 @@ import fcntl
 import io
 import os
 import select
+import shutil
 import struct
 import subprocess
 import sys
@@ -40,8 +41,9 @@ from openpilot.selfdrive.ui.sunnypilot.layouts.settings.external_storage import 
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
-from openpilot.system.ui.widgets import Widget
+from openpilot.system.ui.widgets import Widget, DialogResult
 from openpilot.system.ui.widgets.button import Button, ButtonStyle
+from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 from openpilot.system.ui.widgets.nav_widget import NavWidget
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 
@@ -212,6 +214,64 @@ def export_mountpoint():
 def segment_cameras(seg_dir: str) -> list:
   return [(CAMERA_FOLDER[file], os.path.join(seg_dir, file)) for _, file in CAMERAS
           if os.path.isfile(os.path.join(seg_dir, file))]
+
+
+def segment_mtime(seg_dir: str) -> float:
+  mt = 0.0
+  for _, file in CAMERAS:
+    path = os.path.join(seg_dir, file)
+    if os.path.isfile(path):
+      try:
+        mt = max(mt, os.path.getmtime(path))
+      except OSError:
+        pass
+  if mt == 0.0:
+    try:
+      mt = os.path.getmtime(seg_dir)
+    except OSError:
+      mt = 0.0
+  return mt
+
+
+def segments_on_date(date: str) -> list:
+  """Every finished segment directory (any camera) recorded on `date`."""
+  out: list = []
+  root = Paths.log_root()
+  try:
+    names = os.listdir(root)
+  except OSError:
+    return out
+  for name in names:
+    seg_dir = os.path.join(root, name)
+    if "--" not in name or not os.path.isdir(seg_dir):
+      continue
+    if os.path.exists(os.path.join(seg_dir, "rlog.lock")):
+      continue
+    mt = segment_mtime(seg_dir)
+    if mt and time.strftime("%Y-%m-%d", time.localtime(mt)) == date:
+      out.append(seg_dir)
+  return out
+
+
+def delete_segments(seg_dirs: list) -> tuple:
+  """Delete segment directories under the log root. Returns (deleted, errors)."""
+  root = os.path.realpath(Paths.log_root())
+  deleted = 0
+  errors = 0
+  for seg_dir in seg_dirs:
+    real = os.path.realpath(seg_dir)
+    if not real.startswith(root + os.sep) or "--" not in os.path.basename(real) or not os.path.isdir(real):
+      errors += 1
+      continue
+    if os.path.exists(os.path.join(real, "rlog.lock")):
+      errors += 1
+      continue
+    try:
+      shutil.rmtree(real)
+      deleted += 1
+    except OSError:
+      errors += 1
+  return deleted, errors
 
 
 def _remux_one(src: str, dst: str) -> tuple:
@@ -1134,8 +1194,9 @@ class DashCamPlayer(NavWidget):
       x += btn_w + gap
 
 
-def _draw_text_button(rect: rl.Rectangle, text: str, font, enabled: bool = True) -> None:
-  bg = rl.Color(32, 60, 96, 255) if enabled else rl.Color(52, 52, 52, 255)
+def _draw_text_button(rect: rl.Rectangle, text: str, font, enabled: bool = True, color=None) -> None:
+  base = color if color is not None else rl.Color(32, 60, 96, 255)
+  bg = base if enabled else rl.Color(52, 52, 52, 255)
   rl.draw_rectangle_rounded(rect, 0.15, 8, bg)
   size = measure_text_cached(font, text, 36)
   pos = rl.Vector2(rect.x + (rect.width - size.x) / 2, rect.y + (rect.height - size.y) / 2)
@@ -1143,17 +1204,19 @@ def _draw_text_button(rect: rl.Rectangle, text: str, font, enabled: bool = True)
 
 
 class _ClipRow(Widget):
-  """A single clip: tap the checkbox to select it, tap the row to play."""
+  """A single clip: tap the checkbox to select it, tap the row to play, Delete removes it."""
 
   HEIGHT = 150
   CHECKBOX_ZONE = 150
+  DELETE_W = 210
 
-  def __init__(self, clip: Clip, selected: bool, on_open, on_toggle):
+  def __init__(self, clip: Clip, selected: bool, on_open, on_toggle, on_delete):
     super().__init__()
     self._clip = clip
     self._selected = selected
     self._on_open = on_open
     self._on_toggle = on_toggle
+    self._on_delete = on_delete
     self._rect = rl.Rectangle(0, 0, 0, self.HEIGHT)
     self._font = gui_app.font(FontWeight.MEDIUM)
     self._small = gui_app.font(FontWeight.NORMAL)
@@ -1162,8 +1225,13 @@ class _ClipRow(Widget):
     super().set_parent_rect(parent_rect)
     self._rect.width = parent_rect.width
 
+  def _delete_rect(self, rect: rl.Rectangle) -> rl.Rectangle:
+    return rl.Rectangle(rect.x + rect.width - self.DELETE_W - 40, rect.y + (rect.height - 92) / 2, self.DELETE_W, 92)
+
   def _handle_mouse_release(self, mouse_pos) -> None:
-    if mouse_pos.x - self._rect.x < self.CHECKBOX_ZONE:
+    if rl.check_collision_point_rec(mouse_pos, self._delete_rect(self._rect)):
+      self._on_delete(self._clip)
+    elif mouse_pos.x - self._rect.x < self.CHECKBOX_ZONE:
       self._selected = not self._selected
       self._on_toggle(self._clip, self._selected)
     else:
@@ -1183,21 +1251,25 @@ class _ClipRow(Widget):
     text_x = rect.x + self.CHECKBOX_ZONE + 20
     rl.draw_text_ex(self._font, self._clip.time_text, rl.Vector2(text_x, rect.y + 28), 46, 0, rl.WHITE)
     rl.draw_text_ex(self._small, tr("segment") + f" {self._clip.segment}", rl.Vector2(text_x, rect.y + 88), 34, 0, SUBTEXT_COLOR)
+    _draw_text_button(self._delete_rect(rect), tr("Delete"), self._small, color=rl.Color(150, 45, 45, 255))
 
 
 class _DateRow(Widget):
-  """A day's folder: tap to open its clips, or use Export day."""
+  """A day's folder: tap to open its clips, or use Export day / Delete day."""
 
   HEIGHT = 160
-  EXPORT_W = 250
+  EXPORT_W = 210
+  DELETE_W = 210
+  GAP = 16
 
-  def __init__(self, date: str, count: int, can_export: bool, on_open, on_export):
+  def __init__(self, date: str, count: int, can_export: bool, on_open, on_export, on_delete):
     super().__init__()
     self._date = date
     self._count = count
     self._can_export = can_export
     self._on_open = on_open
     self._on_export = on_export
+    self._on_delete = on_delete
     self._rect = rl.Rectangle(0, 0, 0, self.HEIGHT)
     self._font = gui_app.font(FontWeight.MEDIUM)
     self._small = gui_app.font(FontWeight.NORMAL)
@@ -1206,11 +1278,17 @@ class _DateRow(Widget):
     super().set_parent_rect(parent_rect)
     self._rect.width = parent_rect.width
 
+  def _delete_rect(self, rect: rl.Rectangle) -> rl.Rectangle:
+    return rl.Rectangle(rect.x + rect.width - self.DELETE_W - 40, rect.y + (rect.height - 92) / 2, self.DELETE_W, 92)
+
   def _export_rect(self, rect: rl.Rectangle) -> rl.Rectangle:
-    return rl.Rectangle(rect.x + rect.width - self.EXPORT_W - 40, rect.y + (rect.height - 92) / 2, self.EXPORT_W, 92)
+    x = rect.x + rect.width - self.DELETE_W - self.GAP - self.EXPORT_W - 40
+    return rl.Rectangle(x, rect.y + (rect.height - 92) / 2, self.EXPORT_W, 92)
 
   def _handle_mouse_release(self, mouse_pos) -> None:
-    if rl.check_collision_point_rec(mouse_pos, self._export_rect(self._rect)):
+    if rl.check_collision_point_rec(mouse_pos, self._delete_rect(self._rect)):
+      self._on_delete(self._date)
+    elif rl.check_collision_point_rec(mouse_pos, self._export_rect(self._rect)):
       if self._can_export:
         self._on_export()
       # A disabled Export button must not fall through to opening the folder.
@@ -1223,6 +1301,7 @@ class _DateRow(Widget):
     rl.draw_text_ex(self._font, self._date, rl.Vector2(rect.x + 40, rect.y + 30), 52, 0, rl.WHITE)
     rl.draw_text_ex(self._small, f"{self._count} " + tr("clip(s)"), rl.Vector2(rect.x + 40, rect.y + 96), 34, 0, SUBTEXT_COLOR)
     _draw_text_button(self._export_rect(rect), tr("Export day"), self._small, self._can_export)
+    _draw_text_button(self._delete_rect(rect), tr("Delete day"), self._small, color=rl.Color(150, 45, 45, 255))
 
 
 class ExportProgressDialog(NavWidget):
@@ -1369,6 +1448,38 @@ class DashCamLayout(Widget):
   def _export_date(self, date: str) -> None:
     self._start_export_for(self._clips_on_date(date))
 
+  # ---- delete ----
+  def _confirm_delete(self, text: str, action) -> None:
+    def cb(result: int):
+      if result == DialogResult.CONFIRM:
+        action()
+    gui_app.push_widget(ConfirmDialog(text, tr("Delete"), callback=cb))
+
+  def _delete_clip(self, clip: Clip) -> None:
+    msg = tr("Delete this recording?") + f"  {clip.time_text}  -  " + tr("segment") + f" {clip.segment}"
+
+    def do_delete():
+      delete_segments([os.path.dirname(clip.path)])
+      self._selected.discard(clip.name)
+      self._reload()
+      if self._selected_date and not self._clips_on_date(self._selected_date):
+        self._selected_date = None
+        self._reload()
+
+    self._confirm_delete(msg, do_delete)
+
+  def _delete_date(self, date: str) -> None:
+    segs = segments_on_date(date)
+    msg = tr("Delete all recordings from") + f" {date} ({len(segs)})?"
+
+    def do_delete():
+      delete_segments(segs)
+      if self._selected_date == date:
+        self._selected_date = None
+      self._reload()
+
+    self._confirm_delete(msg, do_delete)
+
   # ---- list ----
   def _reload(self) -> None:
     self._clips = list_clips(CAMERAS[self._camera_idx][1])
@@ -1382,10 +1493,11 @@ class DashCamLayout(Widget):
         d = time.strftime("%Y-%m-%d", time.localtime(c.mtime))
         grouped[d] = grouped.get(d, 0) + 1
       for d in sorted(grouped.keys(), reverse=True):
-        rows.append(_DateRow(d, grouped[d], can_export, lambda d=d: self._open_date(d), lambda d=d: self._export_date(d)))
+        rows.append(_DateRow(d, grouped[d], can_export, lambda d=d: self._open_date(d),
+                             lambda d=d: self._export_date(d), self._delete_date))
     else:
       for c in self._clips_on_date(self._selected_date):
-        rows.append(_ClipRow(c, c.name in self._selected, self._open_clip, self._toggle))
+        rows.append(_ClipRow(c, c.name in self._selected, self._open_clip, self._toggle, self._delete_clip))
 
     self._scroller = Scroller(rows, spacing=12, line_separator=False, pad_end=True)
     self._scroller.show_event()
