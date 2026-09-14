@@ -58,6 +58,17 @@ class UIStateSP:
     self.torque_override_enabled: bool = False
     self._sp_initialized: bool = False
 
+  @property
+  def is_parked(self) -> bool:
+    """Offroad, or onroad with the gear selector in Park.
+
+    Parked-only tools (dash cam playback, external storage) are allowed here so
+    they remain usable with the ignition on as long as the car is in Park.
+    """
+    if not self.started:
+      return True
+    return self.sm["carState"].gearShifter == car.CarState.GearShifter.park
+
   def update(self) -> None:
     if self.sunnylink_enabled:
       self.sunnylink_state.start()

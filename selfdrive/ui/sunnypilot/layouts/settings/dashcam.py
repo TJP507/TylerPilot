@@ -887,7 +887,7 @@ class _IconButton(Button):
 
 
 class DashCamPlayer(NavWidget):
-  """Full screen, offroad-only player with play/pause, clip skip and 10s seek."""
+  """Full screen, parked-only player with play/pause, clip skip and 10s seek."""
 
   def __init__(self, clips: list[Clip], camera_file: str, index: int):
     super().__init__()
@@ -1023,9 +1023,12 @@ class DashCamPlayer(NavWidget):
 
   def _update_state(self) -> None:
     super()._update_state()
-    # Never allow playback while driving
-    if ui_state.started:
+    # Playback is only allowed while parked; if the gear leaves Park while a
+    # clip is playing, close the player cleanly instead of leaving it frozen.
+    if not ui_state.is_parked:
       self._playing = False
+      if self._decoder is not None:
+        self._decoder.set_playing(False)
       self.dismiss()
       return
     # Keep the screen awake (and the settings open) while a video is actively
@@ -1271,7 +1274,7 @@ class ExportProgressDialog(NavWidget):
 
 
 class DashCamLayout(Widget):
-  """Offroad-only settings panel: browse dates, play clips and export to USB."""
+  """Parked-only settings panel: browse dates, play clips and export to USB."""
 
   def __init__(self):
     super().__init__()
@@ -1432,8 +1435,8 @@ class DashCamLayout(Widget):
     rl.draw_text_ex(self._font, text, pos, 44, 0, rl.Color(200, 200, 200, 255))
 
   def _render(self, rect: rl.Rectangle) -> None:
-    if not ui_state.is_offroad():
-      self._draw_message(rect, tr("Dash cam playback is only available while parked"))
+    if not ui_state.is_parked:
+      self._draw_message(rect, tr("Dash cam playback is only available while parked or in gear P"))
       return
 
     if not self._loaded:

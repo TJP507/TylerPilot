@@ -605,6 +605,7 @@ class ExternalStoragePanel(NavWidget):
     self._scroller = Scroller([], spacing=16, line_separator=False, pad_end=True)
     self._rows: list = []
     self._seen_snapshot_rev = -1
+    self._was_parked = True
     self._btn_back = self._child(Button(tr("Back"), lambda: self.dismiss(), font_size=40))
     self._btn_rescan = self._child(Button(tr("Rescan"), self._rescan, font_size=40))
 
@@ -623,6 +624,7 @@ class ExternalStoragePanel(NavWidget):
     super().show_event()
     global _ACTIVE_PANEL
     _ACTIVE_PANEL = self
+    self._was_parked = ui_state.is_parked
     self._rescan()
 
   def hide_event(self) -> None:
@@ -714,17 +716,27 @@ class ExternalStoragePanel(NavWidget):
   # ---- render ----
   def _update_state(self) -> None:
     super()._update_state()
+    parked = ui_state.is_parked
+    if self._was_parked and not parked:
+      # Gear left Park while the panel was open: close it cleanly.
+      _dismiss_active_panel()
+      return
+    self._was_parked = parked
     if external_revision() != self._seen_snapshot_rev:
       self._sync_rows()
 
   def _render(self, rect: rl.Rectangle) -> None:
-    if not ui_state.is_offroad():
-      self._draw_center(rect, tr("External storage tools are only available while parked"))
-      return
-
+    # Header and Back are drawn unconditionally: the tools can become
+    # unavailable (gear leaves Park) while the panel is open, and the user must
+    # never be stranded on a screen with no way out.
     self._btn_back.render(rl.Rectangle(rect.x, rect.y, 200, 84))
     self._btn_rescan.render(rl.Rectangle(rect.x + rect.width - 240, rect.y, 240, 84))
     rl.draw_text_ex(self._font, tr("External Storage"), rl.Vector2(rect.x + 240, rect.y + 8), 56, 0, TEXT_COLOR)
+
+    if not ui_state.is_parked:
+      self._draw_center(rl.Rectangle(rect.x, rect.y + 160, rect.width, max(rect.height - 160, 0)),
+                        tr("External storage tools are only available while parked or in gear P"))
+      return
 
     status = operation_status()
     active, label, result, failed = status["active"], status["label"], status["result"], status["failed"]
