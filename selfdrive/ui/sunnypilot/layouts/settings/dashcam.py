@@ -36,6 +36,7 @@ import pyray as rl
 from openpilot.common.basedir import BASEDIR
 from openpilot.system.hardware.hw import Paths
 from openpilot.selfdrive.ui.ui_state import ui_state, device
+from openpilot.selfdrive.ui.sunnypilot.layouts.settings.external_storage import first_mounted_external
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -102,13 +103,16 @@ ROW_BG_PRESSED = rl.Color(74, 74, 74, 255)
 SUBTEXT_COLOR = rl.Color(170, 170, 170, 255)
 
 _ACTIVE_PLAYER = None  # set while a DashCamPlayer is on the nav stack
+_ACTIVE_DIALOG = None  # set while the export progress dialog is on the nav stack
 _TIMEOUT_CB_REGISTERED = False
 
 
 def _dismiss_active_player() -> None:
   # The settings menu closes itself on the interactive timeout, but a pushed
-  # player widget would otherwise be left on screen. Close it gracefully too.
-  if _ACTIVE_PLAYER is not None:
+  # player or export dialog would otherwise be left on screen.
+  if _ACTIVE_DIALOG is not None:
+    _ACTIVE_DIALOG.dismiss()
+  elif _ACTIVE_PLAYER is not None:
     _ACTIVE_PLAYER.graceful_close()
 
 
@@ -161,6 +165,172 @@ def list_clips(camera_file: str) -> list[Clip]:
 
   clips.sort(key=lambda c: c.mtime, reverse=True)
   return clips
+
+
+# ---------------------------------------------------------------------------
+# Export: remux a segment's cameras to .mp4 on a mounted USB drive.
+# ---------------------------------------------------------------------------
+FFMPEG = "/usr/local/venv/bin/ffmpeg"
+EXPORT_DIR_NAME = "tylerpilot"
+SEGMENT_SECONDS = 60.0
+# camera file -> export subfolder on the USB drive
+CAMERA_FOLDER = {"fcamera.hevc": "front", "ecamera.hevc": "wide", "dcamera.hevc": "driver", "qcamera.ts": "cabin"}
+
+_EXPORT_LOCK = threading.Lock()
+_EXPORT: dict = {"active": False, "done": 0, "total": 0, "fraction": 0.0, "current": "",
+                 "cancel": False, "result": "", "failed": False, "revision": 0}
+
+
+def export_status() -> dict:
+  with _EXPORT_LOCK:
+    return dict(_EXPORT)
+
+
+def export_active() -> bool:
+  with _EXPORT_LOCK:
+    return _EXPORT["active"]
+
+
+def request_export_cancel() -> None:
+  with _EXPORT_LOCK:
+    _EXPORT["cancel"] = True
+
+
+_MOUNT_CACHE = {"t": -10.0, "mp": None}
+
+
+def export_mountpoint():
+  """Mountpoint of the first mounted external drive, cached briefly."""
+  now = time.monotonic()
+  if now - _MOUNT_CACHE["t"] > 2.0:
+    _MOUNT_CACHE["t"] = now
+    entry = first_mounted_external()
+    _MOUNT_CACHE["mp"] = entry.get("mountpoint") if entry else None
+  return _MOUNT_CACHE["mp"]
+
+
+def segment_cameras(seg_dir: str) -> list:
+  return [(CAMERA_FOLDER[file], os.path.join(seg_dir, file)) for _, file in CAMERAS
+          if os.path.isfile(os.path.join(seg_dir, file))]
+
+
+def _remux_one(src: str, dst: str) -> tuple:
+  """Stream-copy src to an mp4 at dst via ffmpeg. Returns (ok, cancelled)."""
+  cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-y"]
+  if not src.endswith(".ts"):
+    # Raw HEVC carries no container timestamps; generate them at the record rate.
+    cmd += ["-fflags", "+genpts", "-r", str(int(PLAYER_FPS))]
+  cmd += ["-i", src, "-c", "copy", dst]
+  try:
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+  except OSError:
+    return False, False
+
+  cancelled = False
+  if proc.stdout is not None:
+    for line in proc.stdout:
+      line = line.strip()
+      if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+        try:
+          us = int(line.split("=", 1)[1])
+        except ValueError:
+          continue
+        with _EXPORT_LOCK:
+          _EXPORT["fraction"] = min((us / 1e6) / SEGMENT_SECONDS, 1.0)
+          cancel = _EXPORT["cancel"]
+        if cancel and not cancelled:
+          cancelled = True
+          proc.terminate()
+      elif line.startswith("progress=end"):
+        break
+  proc.wait()
+  if cancelled or proc.returncode != 0:
+    try:
+      os.remove(dst)
+    except OSError:
+      pass
+    return False, cancelled
+  return True, False
+
+
+def _run_export(segments: list, mountpoint: str) -> None:
+  """segments is a list of (seg_dir, seg_mtime). Writes into <usb>/tylerpilot/."""
+  plan = []
+  total = 0
+  for seg_dir, mtime in segments:
+    cams = segment_cameras(seg_dir)
+    if cams:
+      plan.append((seg_dir, mtime, cams))
+      total += len(cams)
+
+  with _EXPORT_LOCK:
+    _EXPORT.update(done=0, total=total, fraction=0.0, current="", cancel=False)
+
+  done = 0
+  errors = 0
+  cancelled = False
+  for _seg_dir, mtime, cams in plan:
+    date = time.strftime("%Y-%m-%d", time.localtime(mtime))
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(mtime))
+    for folder, src in cams:
+      if cancelled:
+        break
+      out_dir = os.path.join(mountpoint, EXPORT_DIR_NAME, date, folder)
+      try:
+        os.makedirs(out_dir, exist_ok=True)
+      except OSError:
+        errors += 1
+        done += 1
+        continue
+      dst = os.path.join(out_dir, f"{stamp}_{folder}.mp4")
+      with _EXPORT_LOCK:
+        _EXPORT["current"] = os.path.basename(dst)
+        _EXPORT["fraction"] = 0.0
+      ok, was_cancelled = _remux_one(src, dst)
+      if was_cancelled:
+        cancelled = True
+      else:
+        done += 1
+        if not ok:
+          errors += 1
+      with _EXPORT_LOCK:
+        _EXPORT["done"] = done
+        _EXPORT["fraction"] = 0.0
+    if cancelled:
+      break
+
+  root = os.path.join(mountpoint, EXPORT_DIR_NAME)
+  if cancelled:
+    result = tr("Cancelled") + f". {done}/{total} " + tr("file(s) exported to") + f" {root}"
+  elif errors:
+    result = f"{done - errors} " + tr("exported,") + f" {errors} " + tr("failed") + f" -> {root}"
+  else:
+    result = f"{done} " + tr("file(s) exported to") + f" {root}"
+  with _EXPORT_LOCK:
+    _EXPORT["result"] = result
+    _EXPORT["failed"] = errors > 0
+
+
+def start_export(segments: list, mountpoint: str) -> bool:
+  with _EXPORT_LOCK:
+    if _EXPORT["active"]:
+      return False
+    _EXPORT.update(active=True, cancel=False, done=0, total=0, fraction=0.0, current="", result="", failed=False)
+
+  def worker():
+    try:
+      _run_export(segments, mountpoint)
+    except Exception as e:
+      with _EXPORT_LOCK:
+        _EXPORT["result"] = tr("Export failed") + f": {e}"
+        _EXPORT["failed"] = True
+    finally:
+      with _EXPORT_LOCK:
+        _EXPORT["active"] = False
+        _EXPORT["revision"] += 1
+
+  threading.Thread(target=worker, daemon=True, name="dashcam_export").start()
+  return True
 
 
 class _SoftwareDecoder(threading.Thread):
@@ -774,6 +944,7 @@ class DashCamPlayer(NavWidget):
     self._btn_fwd10 = self._child(_IconButton("icons/seek-forward-10.png", lambda: self._seek_rel(10)))
     self._btn_next = self._child(_IconButton("icons/next.png", self._next_clip))
     self._btn_close = self._child(_IconButton("icons/close2.png", lambda: self.dismiss(), button_style=ButtonStyle.DANGER))
+    self._btn_export = self._child(Button(tr("Export"), self._export_current, font_size=40, button_style=ButtonStyle.PRIMARY))
 
     global _TIMEOUT_CB_REGISTERED
     if not _TIMEOUT_CB_REGISTERED:
@@ -870,6 +1041,16 @@ class DashCamPlayer(NavWidget):
     if self._index < len(self._clips) - 1:
       self._load_clip(self._index + 1)
 
+  def _export_current(self) -> None:
+    if export_active() or not self._clips:
+      return
+    mnt = export_mountpoint()
+    if not mnt:
+      return
+    clip = self._clips[self._index]
+    start_export([(os.path.dirname(clip.path), clip.mtime)], mnt)
+    gui_app.push_widget(ExportProgressDialog())
+
   def _update_state(self) -> None:
     super()._update_state()
     # Never allow playback while driving
@@ -919,10 +1100,14 @@ class DashCamPlayer(NavWidget):
       clip = self._clips[self._index]
       title = f"{clip.date_text}   {clip.time_text}   -   segment {clip.segment}"
       rl.draw_text_ex(self._font, title, rl.Vector2(rect.x + 40, rect.y + 30), 40, 0, rl.WHITE)
+      export_w = 220
+      export_rect = rl.Rectangle(rect.x + rect.width - 40 - export_w, rect.y + 14, export_w, 80)
+      self._btn_export.set_enabled(export_mountpoint() is not None and not export_active())
+      self._btn_export.render(export_rect)
       if total > 0:
         label = f"{_fmt_time(cur_fidx / PLAYER_FPS)} / {_fmt_time(total / PLAYER_FPS)}"
         size = measure_text_cached(self._font, label, 40)
-        rl.draw_text_ex(self._font, label, rl.Vector2(rect.x + rect.width - 40 - size.x, rect.y + 30), 40, 0, rl.WHITE)
+        rl.draw_text_ex(self._font, label, rl.Vector2(export_rect.x - 30 - size.x, rect.y + 30), 40, 0, rl.WHITE)
 
     if self._error:
       rl.draw_text_ex(self._font, self._error, rl.Vector2(video_rect.x + 20, video_rect.y + 20), 36, 0, rl.RED)
@@ -939,64 +1124,269 @@ class DashCamPlayer(NavWidget):
       x += btn_w + gap
 
 
+def _draw_text_button(rect: rl.Rectangle, text: str, font, enabled: bool = True) -> None:
+  bg = rl.Color(32, 60, 96, 255) if enabled else rl.Color(52, 52, 52, 255)
+  rl.draw_rectangle_rounded(rect, 0.15, 8, bg)
+  size = measure_text_cached(font, text, 36)
+  pos = rl.Vector2(rect.x + (rect.width - size.x) / 2, rect.y + (rect.height - size.y) / 2)
+  rl.draw_text_ex(font, text, pos, 36, 0, rl.WHITE if enabled else rl.Color(150, 150, 150, 255))
+
+
 class _ClipRow(Widget):
-  def __init__(self, clip: Clip, callback):
+  """A single clip: tap the checkbox to select it, tap the row to play."""
+
+  HEIGHT = 150
+  CHECKBOX_ZONE = 150
+
+  def __init__(self, clip: Clip, selected: bool, on_open, on_toggle):
     super().__init__()
     self._clip = clip
-    self._rect = rl.Rectangle(0, 0, 0, 150)
-    self.set_click_callback(lambda: callback(self._clip))
+    self._selected = selected
+    self._on_open = on_open
+    self._on_toggle = on_toggle
+    self._rect = rl.Rectangle(0, 0, 0, self.HEIGHT)
     self._font = gui_app.font(FontWeight.MEDIUM)
-    self._small_font = gui_app.font(FontWeight.NORMAL)
+    self._small = gui_app.font(FontWeight.NORMAL)
 
   def set_parent_rect(self, parent_rect: rl.Rectangle) -> None:
     super().set_parent_rect(parent_rect)
     self._rect.width = parent_rect.width
 
+  def _handle_mouse_release(self, mouse_pos) -> None:
+    if mouse_pos.x - self._rect.x < self.CHECKBOX_ZONE:
+      self._selected = not self._selected
+      self._on_toggle(self._clip, self._selected)
+    else:
+      self._on_open()
+
   def _render(self, rect: rl.Rectangle) -> None:
     bg = ROW_BG_PRESSED if self.is_pressed else ROW_BG
     rl.draw_rectangle_rounded(rect, 0.15, 8, bg)
-    rl.draw_text_ex(self._font, self._clip.date_text, rl.Vector2(rect.x + 40, rect.y + 28), 46, 0, rl.WHITE)
-    subtitle = f"{self._clip.time_text}   -   segment {self._clip.segment}"
-    rl.draw_text_ex(self._small_font, subtitle, rl.Vector2(rect.x + 40, rect.y + 88), 34, 0, SUBTEXT_COLOR)
+
+    box = rl.Rectangle(rect.x + 45, rect.y + (rect.height - 58) / 2, 58, 58)
+    rl.draw_rectangle_rounded(box, 0.25, 6, rl.Color(25, 25, 25, 255))
+    rl.draw_rectangle_rounded_lines_ex(box, 0.25, 6, 3, rl.Color(200, 200, 200, 255))
+    if self._selected:
+      inner = rl.Rectangle(box.x + 9, box.y + 9, box.width - 18, box.height - 18)
+      rl.draw_rectangle_rounded(inner, 0.3, 6, rl.Color(80, 160, 255, 255))
+
+    text_x = rect.x + self.CHECKBOX_ZONE + 20
+    rl.draw_text_ex(self._font, self._clip.time_text, rl.Vector2(text_x, rect.y + 28), 46, 0, rl.WHITE)
+    rl.draw_text_ex(self._small, tr("segment") + f" {self._clip.segment}", rl.Vector2(text_x, rect.y + 88), 34, 0, SUBTEXT_COLOR)
+
+
+class _DateRow(Widget):
+  """A day's folder: tap to open its clips, or use Export day."""
+
+  HEIGHT = 160
+  EXPORT_W = 250
+
+  def __init__(self, date: str, count: int, can_export: bool, on_open, on_export):
+    super().__init__()
+    self._date = date
+    self._count = count
+    self._can_export = can_export
+    self._on_open = on_open
+    self._on_export = on_export
+    self._rect = rl.Rectangle(0, 0, 0, self.HEIGHT)
+    self._font = gui_app.font(FontWeight.MEDIUM)
+    self._small = gui_app.font(FontWeight.NORMAL)
+
+  def set_parent_rect(self, parent_rect: rl.Rectangle) -> None:
+    super().set_parent_rect(parent_rect)
+    self._rect.width = parent_rect.width
+
+  def _export_rect(self, rect: rl.Rectangle) -> rl.Rectangle:
+    return rl.Rectangle(rect.x + rect.width - self.EXPORT_W - 40, rect.y + (rect.height - 92) / 2, self.EXPORT_W, 92)
+
+  def _handle_mouse_release(self, mouse_pos) -> None:
+    if self._can_export and rl.check_collision_point_rec(mouse_pos, self._export_rect(self._rect)):
+      self._on_export()
+    else:
+      self._on_open()
+
+  def _render(self, rect: rl.Rectangle) -> None:
+    bg = ROW_BG_PRESSED if self.is_pressed else ROW_BG
+    rl.draw_rectangle_rounded(rect, 0.15, 8, bg)
+    rl.draw_text_ex(self._font, self._date, rl.Vector2(rect.x + 40, rect.y + 30), 52, 0, rl.WHITE)
+    rl.draw_text_ex(self._small, f"{self._count} " + tr("clip(s)"), rl.Vector2(rect.x + 40, rect.y + 96), 34, 0, SUBTEXT_COLOR)
+    _draw_text_button(self._export_rect(rect), tr("Export day"), self._small, self._can_export)
+
+
+class ExportProgressDialog(NavWidget):
+  """Modal progress dialog shown while an export runs."""
+
+  def __init__(self):
+    super().__init__()
+    self._font = gui_app.font(FontWeight.MEDIUM)
+    self._small = gui_app.font(FontWeight.NORMAL)
+    self._btn_cancel = self._child(Button(tr("Cancel"), request_export_cancel, font_size=44, button_style=ButtonStyle.DANGER))
+    self._btn_close = self._child(Button(tr("Close"), lambda: self.dismiss(), font_size=44, button_style=ButtonStyle.PRIMARY))
+
+    global _TIMEOUT_CB_REGISTERED
+    if not _TIMEOUT_CB_REGISTERED:
+      device.add_interactive_timeout_callback(_dismiss_active_player)
+      _TIMEOUT_CB_REGISTERED = True
+
+  def show_event(self) -> None:
+    super().show_event()
+    global _ACTIVE_DIALOG
+    _ACTIVE_DIALOG = self
+
+  def hide_event(self) -> None:
+    super().hide_event()
+    global _ACTIVE_DIALOG
+    if _ACTIVE_DIALOG is self:
+      _ACTIVE_DIALOG = None
+
+  def _back_enabled(self) -> bool:
+    return False
+
+  def _render(self, rect: rl.Rectangle) -> None:
+    st = export_status()
+    rl.draw_rectangle_rec(rect, rl.Color(21, 21, 21, 255))
+    total = max(st["total"], 1)
+    frac = min((st["done"] + st["fraction"]) / total, 1.0)
+
+    if st["active"]:
+      title = tr("Exporting to USB drive")
+    elif st["failed"]:
+      title = tr("Export finished with errors")
+    else:
+      title = tr("Export complete")
+    rl.draw_text_ex(self._font, title, rl.Vector2(rect.x + 60, rect.y + 60), 56, 0, rl.WHITE)
+
+    bar_x, bar_w, bar_y, bar_h = rect.x + 60, rect.width - 120, rect.y + 210, 46
+    rl.draw_rectangle_rounded(rl.Rectangle(bar_x, bar_y, bar_w, bar_h), 0.5, 8, rl.Color(60, 60, 60, 255))
+    if frac > 0:
+      rl.draw_rectangle_rounded(rl.Rectangle(bar_x, bar_y, bar_w * frac, bar_h), 0.5, 8, rl.Color(80, 160, 255, 255))
+
+    pct = f"{int(frac * 100)}%"
+    rl.draw_text_ex(self._font, pct, rl.Vector2(bar_x, bar_y + bar_h + 24), 44, 0, rl.WHITE)
+    counts = f"{st['done']}/{st['total']} " + tr("files")
+    csize = measure_text_cached(self._font, counts, 44)
+    rl.draw_text_ex(self._font, counts, rl.Vector2(bar_x + bar_w - csize.x, bar_y + bar_h + 24), 44, 0, rl.WHITE)
+
+    if st["active"] and st["current"]:
+      rl.draw_text_ex(self._small, st["current"], rl.Vector2(bar_x, bar_y + bar_h + 92), 36, 0, SUBTEXT_COLOR)
+    if st["result"]:
+      rl.draw_text_ex(self._small, st["result"], rl.Vector2(bar_x, bar_y + bar_h + 92), 36, 0, SUBTEXT_COLOR)
+
+    y = rect.y + rect.height - 160
+    if st["active"]:
+      self._btn_cancel.render(rl.Rectangle(rect.x + rect.width - 60 - 300, y, 300, 110))
+    else:
+      self._btn_close.render(rl.Rectangle(rect.x + rect.width - 60 - 300, y, 300, 110))
 
 
 class DashCamLayout(Widget):
-  """Offroad-only settings panel: browse and play recorded dash cam clips."""
+  """Offroad-only settings panel: browse dates, play clips and export to USB."""
 
   def __init__(self):
     super().__init__()
     self._camera_idx = 0
     self._clips: list[Clip] = []
+    self._selected_date: str | None = None
+    self._selected: set[str] = set()
+    self._has_rows = False
     self._scroller = Scroller([], spacing=12, line_separator=False, pad_end=True)
     self._loaded = False
     self._font = gui_app.font(FontWeight.MEDIUM)
+    self._small = gui_app.font(FontWeight.NORMAL)
 
     self._picker: list[Button] = []
     for i, (label, _) in enumerate(CAMERAS):
-      btn = self._child(Button(label, lambda idx=i: self._set_camera(idx), font_size=40))
-      self._picker.append(btn)
+      self._picker.append(self._child(Button(label, lambda idx=i: self._set_camera(idx), font_size=40)))
+    self._btn_back = self._child(Button(tr("< Dates"), self._back_to_dates, font_size=40))
+    self._btn_select_all = self._child(Button(tr("Select all"), self._select_all, font_size=40))
+    self._btn_export = self._child(Button(tr("Export"), self._export_selected, font_size=40, button_style=ButtonStyle.PRIMARY))
 
+  # ---- navigation ----
   def _set_camera(self, idx: int) -> None:
     if idx == self._camera_idx and self._loaded:
       return
     self._camera_idx = idx
+    self._selected.clear()
+    self._selected_date = None
     self._reload()
 
+  def _back_to_dates(self) -> None:
+    self._selected_date = None
+    self._reload()
+
+  def _open_date(self, date: str) -> None:
+    self._selected_date = date
+    self._reload()
+
+  def _toggle(self, clip: Clip, selected: bool) -> None:
+    if selected:
+      self._selected.add(clip.name)
+    else:
+      self._selected.discard(clip.name)
+
+  def _clips_on_date(self, date: str) -> list[Clip]:
+    return [c for c in self._clips if time.strftime("%Y-%m-%d", time.localtime(c.mtime)) == date]
+
+  def _visible_clips(self) -> list[Clip]:
+    return self._clips_on_date(self._selected_date) if self._selected_date else list(self._clips)
+
+  def _select_all(self) -> None:
+    names = {c.name for c in self._visible_clips()}
+    if names and names.issubset(self._selected):
+      self._selected -= names
+    else:
+      self._selected |= names
+    self._reload()
+
+  # ---- export ----
+  def _start_export_for(self, clips: list[Clip]) -> None:
+    if export_active() or not clips:
+      return
+    mnt = export_mountpoint()
+    if not mnt:
+      return
+    segs: dict[str, float] = {}
+    for c in clips:
+      segs[os.path.dirname(c.path)] = c.mtime
+    if start_export(list(segs.items()), mnt):
+      gui_app.push_widget(ExportProgressDialog())
+
+  def _export_selected(self) -> None:
+    self._start_export_for([c for c in self._clips if c.name in self._selected])
+
+  def _export_date(self, date: str) -> None:
+    self._start_export_for(self._clips_on_date(date))
+
+  # ---- list ----
   def _reload(self) -> None:
-    camera_file = CAMERAS[self._camera_idx][1]
-    self._clips = list_clips(camera_file)
-    rows = [_ClipRow(clip, self._open_clip) for clip in self._clips]
+    self._clips = list_clips(CAMERAS[self._camera_idx][1])
+    self._selected &= {c.name for c in self._clips}
+    can_export = export_mountpoint() is not None and not export_active()
+
+    rows: list = []
+    if self._selected_date is None:
+      grouped: dict[str, int] = {}
+      for c in self._clips:
+        d = time.strftime("%Y-%m-%d", time.localtime(c.mtime))
+        grouped[d] = grouped.get(d, 0) + 1
+      for d in sorted(grouped.keys(), reverse=True):
+        rows.append(_DateRow(d, grouped[d], can_export, lambda d=d: self._open_date(d), lambda d=d: self._export_date(d)))
+    else:
+      for c in self._clips_on_date(self._selected_date):
+        rows.append(_ClipRow(c, c.name in self._selected, self._open_clip, self._toggle))
+
     self._scroller = Scroller(rows, spacing=12, line_separator=False, pad_end=True)
     self._scroller.show_event()
+    self._has_rows = bool(rows)
     self._loaded = True
 
   def _open_clip(self, clip: Clip) -> None:
+    view = self._visible_clips()
     try:
-      idx = self._clips.index(clip)
+      idx = view.index(clip)
     except ValueError:
       idx = 0
-    camera_file = CAMERAS[self._camera_idx][1]
-    gui_app.push_widget(DashCamPlayer(self._clips, camera_file, idx))
+    gui_app.push_widget(DashCamPlayer(view, CAMERAS[self._camera_idx][1], idx))
 
   def show_event(self) -> None:
     super().show_event()
@@ -1026,9 +1416,24 @@ class DashCamLayout(Widget):
       btn.render(rl.Rectangle(x, py, pw, ph))
       x += pw + gap
 
-    list_y = py + ph + 30
+    ctrl_y = py + ph + 18
+    can_export = export_mountpoint() is not None and not export_active()
+    if self._selected_date is not None:
+      self._btn_back.render(rl.Rectangle(rect.x, ctrl_y, 200, 84))
+      rl.draw_text_ex(self._font, self._selected_date, rl.Vector2(rect.x + 220, ctrl_y + 12), 48, 0, rl.WHITE)
+      if not can_export:
+        rl.draw_text_ex(self._small, tr("No USB drive mounted"), rl.Vector2(rect.x + 500, ctrl_y + 26), 34, 0, rl.Color(255, 180, 120, 255))
+      self._btn_select_all.render(rl.Rectangle(rect.x + rect.width - 580, ctrl_y, 240, 84))
+      self._btn_export.set_enabled(can_export and bool(self._selected) and not export_active())
+      self._btn_export.render(rl.Rectangle(rect.x + rect.width - 320, ctrl_y, 320, 84))
+    else:
+      hint = tr("Select a date to view or export its clips")
+      rl.draw_text_ex(self._small, hint, rl.Vector2(rect.x, ctrl_y + 26), 34, 0, SUBTEXT_COLOR)
+
+    list_y = ctrl_y + 84 + 22
     list_rect = rl.Rectangle(rect.x, list_y, rect.width, rect.height - (list_y - rect.y))
-    if self._clips:
+    if self._has_rows:
       self._scroller.render(list_rect)
     else:
       self._draw_message(list_rect, tr("No recordings found"))
+

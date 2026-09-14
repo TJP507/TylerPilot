@@ -331,6 +331,15 @@ def _drive_mount_entry(disk: str) -> dict:
   return entry
 
 
+def first_mounted_external():
+  """Return the mount entry of the first mounted external drive, or None."""
+  for disk in list_external():
+    entry = _drive_mount_entry(disk)
+    if entry is not None and entry.get("mountpoint"):
+      return entry
+  return None
+
+
 class _DriveRow(Widget):
   """One row per external drive: mount/unmount and whole-drive format."""
 
