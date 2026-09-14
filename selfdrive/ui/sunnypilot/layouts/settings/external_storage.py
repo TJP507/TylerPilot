@@ -1,9 +1,10 @@
 """
 External storage management for developer settings.
 
-Enumerates external (USB) block devices and lets the user mount, unmount and
-format their partitions. Only ext4 and FAT32 are offerable: those are the only
-filesystems the device's kernel and mkfs tools support (no exfat).
+Enumerates external (USB) drives and lets the user mount, unmount and format
+them. Formatting is FAT32 only: vfat is the only filesystem this device can
+create that Windows also supports natively (ext4 needs a third-party Windows
+driver; exFAT/NTFS are unsupported by the 4.9 kernel and its tools).
 
 External is detected from the sysfs bus path rather than the "removable" flag,
 which is 0 for every block device on this hardware. Internal storage lives on
@@ -20,7 +21,7 @@ import time
 
 import pyray as rl
 
-from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.selfdrive.ui.ui_state import ui_state, device
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -61,6 +62,26 @@ def operation_status() -> tuple:
 def _draw_spinner(cx: float, cy: float, radius: float, color: rl.Color) -> None:
   start = (rl.get_time() * 320.0) % 360.0
   rl.draw_ring(rl.Vector2(cx, cy), radius - 10, radius, start, start + 250.0, 40, color)
+
+
+# The panel registers a single interactive-timeout callback so it closes like
+# every other screen instead of lingering after the display wakes back up.
+_ACTIVE_PANEL = None
+_TIMEOUT_CB_REGISTERED = False
+
+
+def _dismiss_active_panel() -> None:
+  panel = _ACTIVE_PANEL
+  if panel is None:
+    return
+  # Pop any confirm dialogs sitting above the panel, then the panel itself.
+  for _ in range(4):
+    top = gui_app.get_active_widget()
+    if top is None or top is panel:
+      break
+    gui_app.pop_widget()
+  if gui_app.get_active_widget() is panel:
+    gui_app.pop_widget()
 
 
 def _run(cmd: list, timeout: float = 20.0) -> subprocess.CompletedProcess:
@@ -208,8 +229,8 @@ def _partition_name(disk: str, idx: int) -> str:
   return f"/dev/{disk}{idx}"
 
 
-def format_whole_drive(disk: str, fs: str) -> tuple:
-  """Wipe the partition table, create one GPT partition spanning the drive, format it."""
+def format_whole_drive(disk: str) -> tuple:
+  """Wipe the partition table, create one GPT partition spanning the drive, format it as FAT32."""
   path = f"/dev/{disk}"
   if not DISK_RE.match(disk) or not _is_external_path(path):
     return False, "refusing to format non-external device"
@@ -226,8 +247,7 @@ def format_whole_drive(disk: str, fs: str) -> tuple:
     return False, "wipefs failed"
   if _run(["sudo", "parted", "-s", path, "mklabel", "gpt"], timeout=60).returncode != 0:
     return False, "mklabel failed"
-  ptype = "ext4" if fs == "ext4" else "fat32"
-  r = _run(["sudo", "parted", "-s", "-a", "optimal", path, "mkpart", "primary", ptype, "1MiB", "100%"], timeout=120)
+  r = _run(["sudo", "parted", "-s", "-a", "optimal", path, "mkpart", "primary", "fat32", "1MiB", "100%"], timeout=120)
   if r.returncode != 0:
     return False, (r.stderr or r.stdout).strip()
 
@@ -240,10 +260,7 @@ def format_whole_drive(disk: str, fs: str) -> tuple:
   if not os.path.exists(new_part):
     return False, "new partition did not appear"
 
-  if fs == "ext4":
-    r = _run(["sudo", "mkfs.ext4", "-F", "-L", FORMAT_LABEL, new_part], timeout=300)
-  else:
-    r = _run(["sudo", "mkfs.vfat", "-F", "32", "-n", FORMAT_LABEL, new_part], timeout=300)
+  r = _run(["sudo", "mkfs.vfat", "-F", "32", "-n", FORMAT_LABEL, new_part], timeout=300)
   return r.returncode == 0, (r.stderr or r.stdout).strip()
 
 
@@ -300,9 +317,7 @@ class _DriveRow(Widget):
     self._small = gui_app.font(FontWeight.NORMAL)
 
     self._btn_toggle = self._child(Button(tr("Mount"), lambda: panel.toggle_mount(entry), font_size=40))
-    self._btn_ext4 = self._child(Button(tr("Format ext4"), lambda: panel.confirm_format_drive(disk, "ext4"),
-                                        font_size=40, button_style=ButtonStyle.DANGER))
-    self._btn_fat = self._child(Button(tr("Format FAT32"), lambda: panel.confirm_format_drive(disk, "vfat"),
+    self._btn_fat = self._child(Button(tr("Format FAT32"), lambda: panel.confirm_format_drive(disk),
                                        font_size=40, button_style=ButtonStyle.DANGER))
 
   def set_parent_rect(self, parent_rect: rl.Rectangle) -> None:
@@ -314,7 +329,7 @@ class _DriveRow(Widget):
     rl.draw_rectangle_rounded(rect, 0.08, 8, rl.Color(58, 40, 40, 255))
 
     mounted = bool(e["mountpoint"]) or os.path.ismount(os.path.join(MOUNT_ROOT, self._disk))
-    title = f"/dev/{self._disk}   {_human_size(self._size)}   -   " + tr("entire drive")
+    title = f"/dev/{self._disk}   {_human_size(self._size)}"
     rl.draw_text_ex(self._font, title, rl.Vector2(rect.x + 40, rect.y + 26), 44, 0, TEXT_COLOR)
 
     if mounted:
@@ -327,11 +342,11 @@ class _DriveRow(Widget):
 
     self._btn_toggle.set_text(tr("Unmount") if mounted else tr("Mount"))
     busy = operation_active()
-    n = 3
+    n = 2
     total_w = n * self.BTN_W + (n - 1) * self.GAP
     x = rect.x + rect.width - total_w - 40
     y = rect.y + (rect.height - self.BTN_H) / 2
-    for btn in (self._btn_toggle, self._btn_ext4, self._btn_fat):
+    for btn in (self._btn_toggle, self._btn_fat):
       btn.set_enabled(not busy)
       btn.render(rl.Rectangle(x, y, self.BTN_W, self.BTN_H))
       x += self.BTN_W + self.GAP
@@ -351,6 +366,11 @@ class ExternalStoragePanel(NavWidget):
     self._btn_back = self._child(Button(tr("Back"), lambda: self.dismiss(), font_size=40))
     self._btn_rescan = self._child(Button(tr("Rescan"), self._reload, font_size=40))
 
+    global _TIMEOUT_CB_REGISTERED
+    if not _TIMEOUT_CB_REGISTERED:
+      device.add_interactive_timeout_callback(_dismiss_active_panel)
+      _TIMEOUT_CB_REGISTERED = True
+
   # Back navigation is via the on-screen Back button only: swipe-to-dismiss
   # fights with list scrolling, so disable the NavWidget gesture entirely.
   def _back_enabled(self) -> bool:
@@ -359,7 +379,15 @@ class ExternalStoragePanel(NavWidget):
   # ---- lifecycle ----
   def show_event(self) -> None:
     super().show_event()
+    global _ACTIVE_PANEL
+    _ACTIVE_PANEL = self
     self._reload()
+
+  def hide_event(self) -> None:
+    super().hide_event()
+    global _ACTIVE_PANEL
+    if _ACTIVE_PANEL is self:
+      _ACTIVE_PANEL = None
 
   def _reload(self) -> None:
     rows: list = []
@@ -380,17 +408,17 @@ class ExternalStoragePanel(NavWidget):
     else:
       self._run_action(mount_partition, entry, tr("Mounting") + f" {entry['path']}", tr("Mounted") + f" {entry['path']}")
 
-  def confirm_format_drive(self, disk: str, fs: str) -> None:
+  def confirm_format_drive(self, disk: str) -> None:
     if operation_active():
       return
 
     def cb(result: int):
       if result == DialogResult.CONFIRM:
-        self._run_action(format_whole_drive, disk, tr("Formatting") + f" /dev/{disk} ({fs})",
-                         tr("Formatted") + f" /dev/{disk} ({fs})", fs)
+        self._run_action(format_whole_drive, disk, tr("Formatting") + f" /dev/{disk} (FAT32)",
+                         tr("Formatted") + f" /dev/{disk} (FAT32)")
 
     msg = (tr("Erase ALL partitions and data on") + f" /dev/{disk} " +
-           tr("and format the entire drive as") + f" {fs}?")
+           tr("and format the entire drive as FAT32?"))
     gui_app.push_widget(ConfirmDialog(msg, tr("Format drive"), callback=cb))
 
   def _run_action(self, fn, arg, start_label: str, done_label: str, *args) -> None:
@@ -436,8 +464,6 @@ class ExternalStoragePanel(NavWidget):
 
     info = tr("USB drives are mounted under") + f" {MOUNT_ROOT}/<device>."
     rl.draw_text_ex(self._small, info, rl.Vector2(rect.x, rect.y + 110), 34, 0, SUBTEXT_COLOR)
-    warn = tr("Formatting permanently erases data. ext4 is recommended; FAT32 is limited to 4 GB files.")
-    rl.draw_text_ex(self._small, warn, rl.Vector2(rect.x, rect.y + 152), 34, 0, WARN_COLOR)
 
     active, label, result, failed, _ = operation_status()
     line = label if active else result
@@ -445,11 +471,11 @@ class ExternalStoragePanel(NavWidget):
       color = WARN_COLOR if active else (rl.RED if failed else GOOD_COLOR)
       text_x = rect.x
       if active:
-        _draw_spinner(rect.x + 18, rect.y + 197, 18, color)
+        _draw_spinner(rect.x + 18, rect.y + 167, 18, color)
         text_x = rect.x + 52
-      rl.draw_text_ex(self._small, line, rl.Vector2(text_x, rect.y + 180), 34, 0, color)
+      rl.draw_text_ex(self._small, line, rl.Vector2(text_x, rect.y + 150), 34, 0, color)
 
-    list_y = rect.y + 240
+    list_y = rect.y + 210
     list_rect = rl.Rectangle(rect.x, list_y, rect.width, max(rect.height - (list_y - rect.y), 0))
     if self._rows:
       self._scroller.render(list_rect)
