@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 
 import pyray as rl
 
@@ -174,6 +175,59 @@ def _human_size(n: int) -> str:
   return f"{n:.1f}T"
 
 
+def _disk_size(disk: str) -> int:
+  try:
+    with open(f"/sys/class/block/{disk}/size") as f:
+      return int(f.read().strip()) * 512
+  except (OSError, ValueError):
+    return 0
+
+
+def _partition_name(disk: str, idx: int) -> str:
+  if disk.startswith("mmcblk") or disk.startswith("nvme"):
+    return f"/dev/{disk}p{idx}"
+  return f"/dev/{disk}{idx}"
+
+
+def format_whole_drive(disk: str, fs: str) -> tuple:
+  """Wipe the partition table, create one GPT partition spanning the drive, format it."""
+  path = f"/dev/{disk}"
+  if not DISK_RE.match(disk) or not _is_external_path(path):
+    return False, "refusing to format non-external device"
+
+  # Release every partition on the disk (mounts and swap) before repartitioning.
+  parts = [e["name"] for e in _disk_entries(disk) if not e.get("is_disk")]
+  for part in parts:
+    _run(["sudo", "umount", f"/dev/{part}"])
+    _run(["sudo", "swapoff", f"/dev/{part}"])
+  _run(["sudo", "umount", path])
+  _run(["sudo", "swapoff", path])
+
+  if _run(["sudo", "wipefs", "-a", path], timeout=60).returncode != 0:
+    return False, "wipefs failed"
+  if _run(["sudo", "parted", "-s", path, "mklabel", "gpt"], timeout=60).returncode != 0:
+    return False, "mklabel failed"
+  ptype = "ext4" if fs == "ext4" else "fat32"
+  r = _run(["sudo", "parted", "-s", "-a", "optimal", path, "mkpart", "primary", ptype, "1MiB", "100%"], timeout=120)
+  if r.returncode != 0:
+    return False, (r.stderr or r.stdout).strip()
+
+  _run(["sudo", "partprobe", path], timeout=30)
+  new_part = _partition_name(disk, 1)
+  for _ in range(24):
+    if os.path.exists(new_part):
+      break
+    time.sleep(0.25)
+  if not os.path.exists(new_part):
+    return False, "new partition did not appear"
+
+  if fs == "ext4":
+    r = _run(["sudo", "mkfs.ext4", "-F", "-L", FORMAT_LABEL, new_part], timeout=300)
+  else:
+    r = _run(["sudo", "mkfs.vfat", "-F", "32", "-n", FORMAT_LABEL, new_part], timeout=300)
+  return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
 def mount_partition(entry: dict) -> tuple:
   if not _is_external_path(entry["path"]):
     return False, "refusing to mount non-external device"
@@ -211,6 +265,47 @@ def format_partition(entry: dict, fs: str) -> tuple:
     return False, f"unsupported filesystem {fs}"
   r = _run(cmd, timeout=180.0)
   return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
+class _DriveRow(Widget):
+  """Whole-drive row: wipes the partition table and creates one partition."""
+
+  HEIGHT = 210
+  BTN_W = 330
+  BTN_H = 96
+  GAP = 20
+
+  def __init__(self, disk: str, size: int, panel: "ExternalStoragePanel"):
+    super().__init__()
+    self._disk = disk
+    self._size = size
+    self._rect = rl.Rectangle(0, 0, 0, self.HEIGHT)
+    self._font = gui_app.font(FontWeight.MEDIUM)
+    self._small = gui_app.font(FontWeight.NORMAL)
+
+    self._btn_ext4 = self._child(Button(tr("Format drive ext4"), lambda: panel.confirm_format_drive(disk, "ext4"),
+                                        font_size=40, button_style=ButtonStyle.DANGER))
+    self._btn_fat = self._child(Button(tr("Format drive FAT32"), lambda: panel.confirm_format_drive(disk, "vfat"),
+                                       font_size=40, button_style=ButtonStyle.DANGER))
+
+  def set_parent_rect(self, parent_rect: rl.Rectangle) -> None:
+    super().set_parent_rect(parent_rect)
+    self._rect.width = parent_rect.width
+
+  def _render(self, rect: rl.Rectangle) -> None:
+    rl.draw_rectangle_rounded(rect, 0.08, 8, rl.Color(58, 40, 40, 255))
+    title = f"/dev/{self._disk}   {_human_size(self._size)}   -   " + tr("entire drive")
+    rl.draw_text_ex(self._font, title, rl.Vector2(rect.x + 40, rect.y + 30), 44, 0, TEXT_COLOR)
+    rl.draw_text_ex(self._small, tr("Erases the partition table and all partitions on this drive."),
+                    rl.Vector2(rect.x + 40, rect.y + 96), 34, 0, WARN_COLOR)
+
+    n = 2
+    total_w = n * self.BTN_W + (n - 1) * self.GAP
+    x = rect.x + rect.width - total_w - 40
+    y = rect.y + (rect.height - self.BTN_H) / 2
+    for btn in (self._btn_ext4, self._btn_fat):
+      btn.render(rl.Rectangle(x, y, self.BTN_W, self.BTN_H))
+      x += self.BTN_W + self.GAP
 
 
 class _PartitionRow(Widget):
@@ -273,6 +368,7 @@ class ExternalStoragePanel(NavWidget):
     self._font = gui_app.font(FontWeight.MEDIUM)
     self._small = gui_app.font(FontWeight.NORMAL)
     self._scroller = Scroller([], spacing=16, line_separator=False, pad_end=True)
+    self._rows: list = []
     self._status = ""
     self._reload_pending = False
     self._busy = False
@@ -285,15 +381,23 @@ class ExternalStoragePanel(NavWidget):
     self._reload()
 
   def _reload(self) -> None:
-    disks = list_external()
     rows: list = []
-    for disk in disks:
+    for disk in list_external():
+      rows.append(_DriveRow(disk, _disk_size(disk), self))
       for entry in _disk_entries(disk):
         entry["mountpoint"] = entry["mountpoint"] or _mountpoint_of(entry["path"])
         rows.append(_PartitionRow(entry, self))
     self._scroller = Scroller(rows, spacing=16, line_separator=False, pad_end=True)
     self._scroller.show_event()
     self._rows = rows
+
+  def _back_enabled(self) -> bool:
+    # Only swipe-away when the list is scrolled to the top, otherwise a
+    # downward drag must scroll the list instead of dismissing the panel.
+    try:
+      return self._scroller.scroll_panel.offset >= -20
+    except Exception:
+      return True
 
   def _set_status(self, text: str, failed: bool = False) -> None:
     with self._lock:
@@ -317,6 +421,18 @@ class ExternalStoragePanel(NavWidget):
 
     msg = tr("Erase ALL data on") + f" {entry['path']} " + tr("and format it as") + f" {fs}?"
     gui_app.push_widget(ConfirmDialog(msg, tr("Format"), callback=cb))
+
+  def confirm_format_drive(self, disk: str, fs: str) -> None:
+    if self._busy:
+      return
+
+    def cb(result: int):
+      if result == DialogResult.CONFIRM:
+        self._run_action(format_whole_drive, disk, tr("Formatted drive") + f" /dev/{disk} ({fs})", fs)
+
+    msg = (tr("Erase ALL partitions and data on") + f" /dev/{disk} " +
+           tr("and format the entire drive as") + f" {fs}?")
+    gui_app.push_widget(ConfirmDialog(msg, tr("Format drive"), callback=cb))
 
   def _run_action(self, fn, entry: dict, ok_msg: str, *args) -> None:
     self._busy = True
@@ -348,7 +464,7 @@ class ExternalStoragePanel(NavWidget):
 
     info = tr("USB drives are mounted under") + f" {MOUNT_ROOT}/<device>."
     rl.draw_text_ex(self._small, info, rl.Vector2(rect.x, rect.y + 68), 34, 0, SUBTEXT_COLOR)
-    warn = tr("Formatting permanently erases the selected partition. ext4 is recommended; FAT32 is limited to 4 GB files.")
+    warn = tr("Formatting permanently erases data. ext4 is recommended; FAT32 is limited to 4 GB files.")
     rl.draw_text_ex(self._small, warn, rl.Vector2(rect.x, rect.y + 110), 34, 0, WARN_COLOR)
     with self._lock:
       status = self._status
