@@ -22,6 +22,9 @@ if gui_app.sunnypilot_ui():
   from openpilot.system.ui.sunnypilot.widgets.list_view import ListItemSP as ListItem
   from openpilot.system.ui.sunnypilot.widgets.list_view import ToggleActionSP as ToggleAction
   from openpilot.system.ui.sunnypilot.widgets.list_view import MultipleButtonActionSP as MultipleButtonAction
+  from openpilot.system.ui.sunnypilot.widgets.list_view import ButtonSP as SelectButton
+else:
+  SelectButton = Button
 
 # These are only used for AdvancedNetworkSettings, standalone apps just need WifiManagerUI
 try:
@@ -82,10 +85,8 @@ class NetworkUI(Widget):
     self._wifi_panel = self._child(WifiPanel(wifi_manager))
     self._cellular_panel = self._child(CellularSettings(wifi_manager))
 
-    self._wifi_btn = self._child(NavButton(tr("Wi-Fi")))
-    self._wifi_btn.set_click_callback(lambda: self._set_panel(PanelType.WIFI))
-    self._cellular_btn = self._child(NavButton(tr("Cellular")))
-    self._cellular_btn.set_click_callback(lambda: self._set_panel(PanelType.CELLULAR))
+    self._wifi_btn = self._child(SelectButton(tr("Wi-Fi"), click_callback=lambda: self._set_panel(PanelType.WIFI), border_radius=20))
+    self._cellular_btn = self._child(SelectButton(tr("Cellular"), click_callback=lambda: self._set_panel(PanelType.CELLULAR), border_radius=20))
 
     self._back_btn = self._child(NavButton(tr("Back")))
     self._back_btn.set_click_callback(self._go_back)
@@ -102,15 +103,14 @@ class NetworkUI(Widget):
 
   def _render(self, _):
     if self._current_panel == PanelType.SELECT:
-      btn_w, btn_h = 350, 120
+      btn_w, btn_h = 800, 150
       gap = 40
-      total_w = btn_w * 2 + gap
-      x = self._rect.x + (self._rect.width - total_w) / 2
-      y = self._rect.y + (self._rect.height - btn_h) / 2
+      x = self._rect.x + (self._rect.width - btn_w) / 2
+      y = self._rect.y + (self._rect.height - (btn_h * 2 + gap)) / 2
 
       self._wifi_btn.set_rect(rl.Rectangle(x, y, btn_w, btn_h))
       self._wifi_btn.render()
-      self._cellular_btn.set_rect(rl.Rectangle(x + btn_w + gap, y, btn_w, btn_h))
+      self._cellular_btn.set_rect(rl.Rectangle(x, y + btn_h + gap, btn_w, btn_h))
       self._cellular_btn.render()
     elif self._current_panel == PanelType.WIFI:
       content_rect = rl.Rectangle(self._rect.x, self._rect.y + 20,

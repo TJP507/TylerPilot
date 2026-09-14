@@ -18,6 +18,10 @@ from openpilot.system.ui.widgets.confirm_dialog import alert_dialog, ConfirmDial
 from openpilot.system.ui.widgets.list_view import text_item
 from openpilot.system.ui.widgets.scroller_tici import LineSeparator
 
+import os
+import shutil
+import time
+
 offroad_time_options = {
   0: 0,
   1: 5,
@@ -34,8 +38,83 @@ offroad_time_options = {
 }
 
 
+def _fmt_bytes(n: float) -> str:
+  units = ("B", "KB", "MB", "GB", "TB", "PB")
+  i = 0
+  while abs(n) >= 1024.0 and i < len(units) - 1:
+    n /= 1024.0
+    i += 1
+  return f"{n:.1f} {units[i]}" if i > 0 else f"{int(n)} {units[i]}"
+
+
+def _device_temp() -> str:
+  base = "/sys/devices/virtual/thermal"
+  best: float | None = None
+  try:
+    names = os.listdir(base)
+  except OSError:
+    return tr("N/A")
+  for name in names:
+    if not name.startswith("thermal_zone"):
+      continue
+    zone = os.path.join(base, name)
+    try:
+      with open(os.path.join(zone, "type")) as f:
+        ztype = f.read().strip()
+      if not (ztype.startswith("cpu") and ztype.endswith("-usr")):
+        continue
+      with open(os.path.join(zone, "temp")) as f:
+        temp = int(f.read()) / 1000.0
+    except (OSError, ValueError):
+      continue
+    if best is None or temp > best:
+      best = temp
+  return f"{best:.0f}\u00b0C" if best is not None else tr("N/A")
+
+
+def _storage_usage(path: str) -> str:
+  try:
+    usage = shutil.disk_usage(path)
+  except OSError:
+    return tr("N/A")
+  return f"{_fmt_bytes(usage.used)} {tr('used')} / {_fmt_bytes(usage.free)} {tr('free')}"
+
+
+def _external_storage_usage() -> str:
+  from openpilot.selfdrive.ui.sunnypilot.layouts.settings.external_storage import first_mounted_external
+  entry = first_mounted_external()
+  mountpoint = entry.get("mountpoint") if entry else None
+  return _storage_usage(mountpoint) if mountpoint else tr("Not mounted")
+
+
+def _memory_usage() -> str:
+  info: dict[str, int] = {}
+  try:
+    with open("/proc/meminfo") as f:
+      for line in f:
+        key, _, value = line.partition(":")
+        if value:
+          info[key.strip()] = int(value.split()[0]) * 1024
+  except (OSError, ValueError):
+    return tr("N/A")
+  total = info.get("MemTotal", 0)
+  available = info.get("MemAvailable", info.get("MemFree", 0))
+  used = max(total - available, 0)
+  return f"{_fmt_bytes(used)} {tr('used')} / {_fmt_bytes(available)} {tr('available')}"
+
+
+def _load_average() -> str:
+  try:
+    one, five, fifteen = os.getloadavg()
+  except OSError:
+    return tr("N/A")
+  return f"{one:.2f} / {five:.2f} / {fifteen:.2f}"
+
+
 class DeviceLayoutSP(DeviceLayout):
   def __init__(self):
+    self._stats: dict[str, str] = {}
+    self._stats_last_update = 0.0
     DeviceLayout.__init__(self)
     self._scroller._line_separator = None
 
@@ -113,6 +192,16 @@ class DeviceLayoutSP(DeviceLayout):
       LineSeparator(),
       text_item(lambda: tr("Serial"), self._params.get("HardwareSerial") or (lambda: tr("N/A"))),
       LineSeparator(),
+      text_item(lambda: tr("Temperature"), lambda: self._stats.get("temp", tr("N/A"))),
+      LineSeparator(),
+      text_item(lambda: tr("Internal Storage"), lambda: self._stats.get("internal", tr("N/A"))),
+      LineSeparator(),
+      text_item(lambda: tr("External Storage"), lambda: self._stats.get("external", tr("N/A"))),
+      LineSeparator(),
+      text_item(lambda: tr("Memory"), lambda: self._stats.get("memory", tr("N/A"))),
+      LineSeparator(),
+      text_item(lambda: tr("Load Average"), lambda: self._stats.get("load", tr("N/A"))),
+      LineSeparator(),
       self._pair_device_btn,
       LineSeparator(),
       self._reset_calib_btn,
@@ -188,6 +277,17 @@ class DeviceLayoutSP(DeviceLayout):
 
   def _update_state(self):
     super()._update_state()
+
+    now = time.monotonic()
+    if now - self._stats_last_update > 1.0:
+      self._stats_last_update = now
+      self._stats = {
+        "temp": _device_temp(),
+        "internal": _storage_usage("/data"),
+        "external": _external_storage_usage(),
+        "memory": _memory_usage(),
+        "load": _load_average(),
+      }
 
     # Handle Always Offroad button
     always_offroad = ui_state.params.get_bool("OffroadMode")
