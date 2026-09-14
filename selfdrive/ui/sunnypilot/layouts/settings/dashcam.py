@@ -12,14 +12,18 @@ streams (fcamera.hevc / ecamera.hevc / dcamera.hevc) plus an H.264/TS cabin stre
 (qcamera.ts).
 
 Raw HEVC has no container timestamps, so seeking is done through openpilot's HEVC
-index (frame -> byte offset) and decoding is done one GOP at a time. Playback is
-software decoded, so it runs slower than real time; that is acceptable for review.
+index (frame -> byte offset). On comma 3X the Qualcomm msm_vidc hardware decoder
+(tools/dashcam/hwdec) is used for real-time playback; a software PyAV decoder is
+kept as a fallback when the helper is unavailable.
 
 Playback is only permitted while the device is offroad.
 """
 import bisect
 import io
 import os
+import struct
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -27,6 +31,7 @@ from dataclasses import dataclass
 import numpy as np
 import pyray as rl
 
+from openpilot.common.basedir import BASEDIR
 from openpilot.system.hardware.hw import Paths
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -36,6 +41,46 @@ from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.button import Button, ButtonStyle
 from openpilot.system.ui.widgets.nav_widget import NavWidget
 from openpilot.system.ui.widgets.scroller_tici import Scroller
+
+_DBG = os.getenv("DASHCAM_DEBUG") is not None
+
+
+def _dbg(*args) -> None:
+  if _DBG:
+    print("[dashcam]", *args, file=sys.stderr, flush=True)
+
+HWDEC_PATH = os.path.join(BASEDIR, "tools", "dashcam", "hwdec")
+
+# GLES YUV -> RGB shader so NV12 frames are color-converted on the GPU.
+YUV_VERTEX_SHADER = """
+#version 300 es
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec3 vertexNormal;
+in vec4 vertexColor;
+uniform mat4 mvp;
+out vec2 fragTexCoord;
+out vec4 fragColor;
+void main() {
+  fragTexCoord = vertexTexCoord;
+  fragColor = vertexColor;
+  gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+"""
+
+YUV_FRAGMENT_SHADER = """
+#version 300 es
+precision mediump float;
+in vec2 fragTexCoord;
+uniform sampler2D texture0;
+uniform sampler2D texture1;
+out vec4 fragColor;
+void main() {
+  float y = texture(texture0, fragTexCoord).r;
+  vec2 uv = texture(texture1, fragTexCoord).ra - 0.5;
+  fragColor = vec4(y + 1.402 * uv.y, y - 0.344 * uv.x - 0.714 * uv.y, y + 1.772 * uv.x, 1.0);
+}
+"""
 
 # (display name, file name inside each segment)
 CAMERAS = [
@@ -101,8 +146,8 @@ def list_clips(camera_file: str) -> list[Clip]:
   return clips
 
 
-class _Decoder(threading.Thread):
-  """Background software decoder. Produces RGBA frames at a fixed size."""
+class _SoftwareDecoder(threading.Thread):
+  """Background software HEVC/TS decoder. Produces RGBA frames at a fixed size."""
 
   def __init__(self, path: str, out_w: int, out_h: int):
     super().__init__(daemon=True)
@@ -116,6 +161,8 @@ class _Decoder(threading.Thread):
     self._lock = threading.Lock()
 
     self._frame: np.ndarray | None = None
+    self._frame_w = 0
+    self._frame_h = 0
     self._seq = 0
     self._fidx = 0
     self._total = 0
@@ -140,7 +187,7 @@ class _Decoder(threading.Thread):
 
   def snapshot(self):
     with self._lock:
-      return self._frame, self._seq, self._fidx, self._total, self._eof, self._error
+      return self._frame, self._frame_w, self._frame_h, self._seq, self._fidx, self._total, self._eof, self._error
 
   # ---- helpers ----
   def _wait_if_paused(self) -> None:
@@ -165,10 +212,12 @@ class _Decoder(threading.Thread):
       return self._seek_to is not None
 
   def _publish(self, frame, fidx: int) -> None:
-    img = frame.reformat(width=self._w, height=self._h, format="rgba")
-    arr = np.ascontiguousarray(img.to_ndarray())
+    img = frame.reformat(format="nv12")
+    arr = np.ascontiguousarray(img.to_ndarray()).reshape(-1)
     with self._lock:
       self._frame = arr
+      self._frame_w = img.width
+      self._frame_h = img.height
       self._seq += 1
       self._fidx = fidx
 
@@ -309,6 +358,229 @@ class _Decoder(threading.Thread):
     container.close()
 
 
+class _HardwareDecoder(threading.Thread):
+  """Background decoder that drives the Qualcomm msm_vidc helper (tools/dashcam/hwdec)."""
+
+  def __init__(self, path: str, out_w: int, out_h: int):
+    super().__init__(daemon=True)
+    self._path = path
+    self._w = out_w
+    self._h = out_h
+
+    self._stop_ev = threading.Event()
+    self._play_ev = threading.Event()
+    self._play_ev.set()
+    self._lock = threading.Lock()
+
+    self._frame: np.ndarray | None = None
+    self._frame_w = 0
+    self._frame_h = 0
+    self._seq = 0
+    self._fidx = 0
+    self._total = 0
+    self._eof = False
+    self._error: str | None = None
+    self._seek_to: int | None = None
+
+    self._img_w = 0
+    self._img_h = 0
+    self._files: list = []
+
+  # ---- thread control (called from UI thread) ----
+  def stop(self) -> None:
+    self._stop_ev.set()
+    self._play_ev.set()
+
+  def set_playing(self, playing: bool) -> None:
+    if playing:
+      self._play_ev.set()
+    else:
+      self._play_ev.clear()
+
+  def request_seek(self, frame_idx: int) -> None:
+    with self._lock:
+      self._seek_to = max(frame_idx, 0)
+
+  def snapshot(self):
+    with self._lock:
+      return self._frame, self._frame_w, self._frame_h, self._seq, self._fidx, self._total, self._eof, self._error
+
+  # ---- helpers ----
+  @staticmethod
+  def _read_exact(stream, n: int) -> bytes | None:
+    buf = bytearray(n)
+    view = memoryview(buf)
+    got = 0
+    while got < n:
+      chunk = stream.read(n - got)
+      if not chunk:
+        return None
+      view[got:got + len(chunk)] = chunk
+      got += len(chunk)
+    return bytes(buf)
+
+  def _take_seek(self) -> int | None:
+    with self._lock:
+      seek = self._seek_to
+      self._seek_to = None
+      return seek
+
+  # ---- session: one hwdec process fed from start_idx ----
+  def _session(self, start_idx: int) -> None:
+    proc = subprocess.Popen([HWDEC_PATH, str(self._img_w), str(self._img_h)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    session_stop = threading.Event()
+    frames = self._files
+
+    def feed():
+      i = start_idx
+      try:
+        with open(self._path, "rb") as fh:
+          while i < len(frames) and not self._stop_ev.is_set():
+            if not self._play_ev.is_set():
+              time.sleep(0.02)
+              continue
+            with self._lock:
+              if self._seek_to is not None:
+                session_stop.set()
+                return
+            _key, pos, size = frames[i]
+            fh.seek(pos)
+            data = fh.read(size)
+            try:
+              proc.stdin.write(struct.pack("<I", len(data)))
+              proc.stdin.write(data)
+              proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+              return
+            i += 1
+      finally:
+        _dbg("feed end at", i)
+        # Close stdin so the decoder flushes its pipeline and exits; the reader
+        # keeps draining stdout until EOF.
+        try:
+          if proc.stdin is not None:
+            proc.stdin.close()
+        except OSError:
+          pass
+
+    writer = threading.Thread(target=feed, daemon=True)
+    writer.start()
+    _dbg("session start", start_idx, "img", self._img_w, self._img_h)
+
+    frames_read = 0
+    t_session = time.monotonic()
+    while not session_stop.is_set() and not self._stop_ev.is_set():
+      hdr = self._read_exact(proc.stdout, 12)
+      if hdr is None:
+        _dbg("reader EOF after", frames_read)
+        break
+      fw, fh_, ln = struct.unpack("<III", hdr)
+      if fw == 0:
+        with self._lock:
+          self._error = "hardware decoder error"
+        _dbg("decoder error")
+        break
+      data = self._read_exact(proc.stdout, ln)
+      if data is None:
+        _dbg("payload EOF after", frames_read)
+        break
+      arr = np.frombuffer(data, dtype=np.uint8)
+      with self._lock:
+        self._frame = arr
+        self._frame_w = fw
+        self._frame_h = fh_
+        self._seq += 1
+        self._fidx = start_idx + frames_read
+      frames_read += 1
+      if frames_read % 60 == 0:
+        _dbg("frames_read", frames_read)
+
+      # Pace playback to the recording frame rate (hardware decode is faster).
+      drift = (frames_read / PLAYER_FPS) - (time.monotonic() - t_session)
+      if drift > 0:
+        time.sleep(drift)
+
+    session_stop.set()
+    _dbg("session end", start_idx, "read", frames_read, "writer_alive", writer.is_alive())
+    try:
+      if proc.stdin is not None:
+        proc.stdin.close()
+    except OSError:
+      pass
+    proc.kill()
+    proc.wait()
+    writer.join(timeout=1.0)
+
+  def run(self) -> None:
+    try:
+      import av
+
+      container = av.open(self._path, format="hevc")
+      stream = container.streams.video[0]
+      self._img_w, self._img_h = stream.width, stream.height
+
+      # Demux once to record each access unit's byte range and keyframe flag.
+      # (A raw slice-only split would drop the in-band parameter sets that
+      # precede IDR frames, which the decoder needs after a port reconfig.)
+      packets: list = []
+      offset = 0
+      for pkt in container.demux(stream):
+        if pkt.size == 0:
+          continue
+        pos = pkt.pos if pkt.pos is not None and pkt.pos >= 0 else offset
+        packets.append((bool(pkt.is_keyframe), int(pos), int(pkt.size)))
+        offset = pos + pkt.size
+      container.close()
+
+      if len(packets) < 2:
+        raise RuntimeError("no decodable frames")
+
+      self._files = packets
+      with self._lock:
+        self._total = len(packets)
+    except Exception as e:
+      with self._lock:
+        self._error = str(e) or type(e).__name__
+        self._eof = True
+      return
+
+    start = 0
+    while not self._stop_ev.is_set():
+      seek = self._take_seek()
+      if seek is not None:
+        start = self._snap_to_gop(seek)
+      self._session(start)
+      if self._stop_ev.is_set():
+        break
+      with self._lock:
+        another_seek = self._seek_to is not None
+      if another_seek:
+        continue
+      with self._lock:
+        self._eof = True
+      while not self._stop_ev.is_set():
+        with self._lock:
+          if self._seek_to is not None:
+            break
+        time.sleep(0.05)
+      with self._lock:
+        self._eof = False
+
+  def _snap_to_gop(self, frame_idx: int) -> int:
+    keyframes = [i for i, (is_key, _, _) in enumerate(self._files) if is_key]
+    if not keyframes:
+      return 0
+    pos = bisect.bisect_right(keyframes, frame_idx) - 1
+    return keyframes[max(pos, 0)]
+
+
+def _create_decoder(path: str, out_w: int, out_h: int):
+  if path.endswith(".hevc") and os.path.isfile(HWDEC_PATH) and os.access(HWDEC_PATH, os.X_OK):
+    return _HardwareDecoder(path, out_w, out_h)
+  return _SoftwareDecoder(path, out_w, out_h)
+
+
 class _IconButton(Button):
   """Button with a centered icon and no text."""
 
@@ -346,11 +618,14 @@ class DashCamPlayer(NavWidget):
     self._clips = clips
     self._camera_file = camera_file
     self._index = index
-    self._decoder: _Decoder | None = None
-    self._texture: rl.Texture | None = None
+    self._decoder: _SoftwareDecoder | _HardwareDecoder | None = None
+    self._tex_y: rl.Texture | None = None
+    self._tex_uv: rl.Texture | None = None
+    self._shader: rl.Shader | None = None
+    self._tex1_loc = 0
+    self._frame_w = 0
+    self._frame_h = 0
     self._last_seq = -1
-    self._tex_w = DISPLAY_W
-    self._tex_h = DISPLAY_H
     self._playing = True
     self._error: str | None = None
 
@@ -367,16 +642,38 @@ class DashCamPlayer(NavWidget):
   # ---- lifecycle ----
   def show_event(self) -> None:
     super().show_event()
-    if self._texture is None:
-      img = rl.gen_image_color(self._tex_w, self._tex_h, rl.BLACK)
-      self._texture = rl.load_texture_from_image(img)
-      rl.set_texture_filter(self._texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
-      rl.unload_image(img)
+    if self._shader is None:
+      self._shader = rl.load_shader_from_memory(YUV_VERTEX_SHADER, YUV_FRAGMENT_SHADER)
+      self._tex1_loc = rl.get_shader_location(self._shader, "texture1")
     self._load_clip(self._index)
 
   def hide_event(self) -> None:
     super().hide_event()
     self._stop_decoder()
+    self._unload_textures()
+
+  def _unload_textures(self) -> None:
+    if self._tex_y is not None:
+      rl.unload_texture(self._tex_y)
+      self._tex_y = None
+    if self._tex_uv is not None:
+      rl.unload_texture(self._tex_uv)
+      self._tex_uv = None
+    self._frame_w = 0
+    self._frame_h = 0
+
+  def _ensure_textures(self, fw: int, fh: int) -> None:
+    if self._tex_y is not None and self._frame_w == fw and self._frame_h == fh:
+      return
+    self._unload_textures()
+    img_y = rl.Image(None, fw, fh, 1, rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_GRAYSCALE)
+    self._tex_y = rl.load_texture_from_image(img_y)
+    rl.set_texture_filter(self._tex_y, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+    img_uv = rl.Image(None, fw // 2, fh // 2, 1, rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA)
+    self._tex_uv = rl.load_texture_from_image(img_uv)
+    rl.set_texture_filter(self._tex_uv, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+    self._frame_w = fw
+    self._frame_h = fh
 
   # ---- playback controls ----
   def _load_clip(self, index: int) -> None:
@@ -390,7 +687,7 @@ class DashCamPlayer(NavWidget):
     self._playing = True
     self._btn_play.set_icon("icons/pause.png")
     clip = self._clips[self._index]
-    self._decoder = _Decoder(clip.path, self._tex_w, self._tex_h)
+    self._decoder = _create_decoder(clip.path, DISPLAY_W, DISPLAY_H)
     self._decoder.start()
 
   def _stop_decoder(self) -> None:
@@ -408,7 +705,7 @@ class DashCamPlayer(NavWidget):
   def _seek_rel(self, seconds: float) -> None:
     if self._decoder is None:
       return
-    _, _, fidx, _, _, _ = self._decoder.snapshot()
+    _, _, _, _, fidx, _, _, _ = self._decoder.snapshot()
     self._decoder.request_seek(max(0, fidx + int(seconds * PLAYER_FPS)))
 
   def _prev_clip(self) -> None:
@@ -429,22 +726,31 @@ class DashCamPlayer(NavWidget):
   # ---- rendering ----
   def _render(self, rect: rl.Rectangle) -> None:
     if self._decoder is not None:
-      frame, seq, _, _, _eof, err = self._decoder.snapshot()
+      frame, fw, fh, seq, _, _, _eof, err = self._decoder.snapshot()
       if err:
         self._error = err
-      if frame is not None and seq != self._last_seq and self._texture is not None:
-        rl.update_texture(self._texture, rl.ffi.cast("void *", frame.ctypes.data))
+      if frame is not None and seq != self._last_seq and fw > 0 and fh > 0:
+        self._ensure_textures(fw, fh)
+        y_plane = frame[:fw * fh]
+        uv_plane = frame[fw * fh:]
+        if self._tex_y is not None:
+          rl.update_texture(self._tex_y, rl.ffi.cast("void *", y_plane.ctypes.data))
+        if self._tex_uv is not None:
+          rl.update_texture(self._tex_uv, rl.ffi.cast("void *", uv_plane.ctypes.data))
         self._last_seq = seq
 
     video_rect = rl.Rectangle(rect.x + 40, rect.y + 90, rect.width - 80, rect.height - 300)
 
-    if self._texture is not None:
-      scale = min(video_rect.width / self._tex_w, video_rect.height / self._tex_h)
-      dw, dh = self._tex_w * scale, self._tex_h * scale
+    if self._tex_y is not None and self._frame_w > 0 and self._frame_h > 0 and self._shader is not None:
+      scale = min(video_rect.width / self._frame_w, video_rect.height / self._frame_h)
+      dw, dh = self._frame_w * scale, self._frame_h * scale
       dst = rl.Rectangle(video_rect.x + (video_rect.width - dw) / 2,
                          video_rect.y + (video_rect.height - dh) / 2, dw, dh)
-      rl.draw_texture_pro(self._texture, rl.Rectangle(0, 0, self._texture.width, self._texture.height),
+      rl.begin_shader_mode(self._shader)
+      rl.set_shader_value_texture(self._shader, self._tex1_loc, self._tex_uv)
+      rl.draw_texture_pro(self._tex_y, rl.Rectangle(0, 0, self._frame_w, self._frame_h),
                           dst, rl.Vector2(0, 0), 0.0, rl.WHITE)
+      rl.end_shader_mode()
 
     if self._clips:
       clip = self._clips[self._index]
