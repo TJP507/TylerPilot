@@ -448,7 +448,7 @@ class _HardwareDecoder(threading.Thread):
             with self._lock:
               if self._seek_to is not None:
                 return
-            if not self._play_ev.is_set() and fed_count >= 12:
+            if not self._play_ev.is_set() and fed_count >= 40:
               time.sleep(0.02)
               continue
             # While paused, feed a short burst so the pipeline flushes and a
