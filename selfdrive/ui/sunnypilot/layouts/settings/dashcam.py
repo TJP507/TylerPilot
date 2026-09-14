@@ -1542,7 +1542,9 @@ class DashCamLayout(Widget):
 
   def show_event(self) -> None:
     super().show_event()
-    # Refresh the list every time the panel is opened
+    # Always reopen on the date list, not the folder last viewed.
+    self._selected_date = None
+    self._selected.clear()
     self._loaded = False
 
   def _draw_message(self, rect: rl.Rectangle, text: str) -> None:
@@ -1558,20 +1560,21 @@ class DashCamLayout(Widget):
     if not self._loaded:
       self._reload()
 
-    rl.draw_text_ex(self._font, tr("Dash Cam"), rl.Vector2(rect.x, rect.y), 56, 0, rl.WHITE)
-
     can_export = export_mountpoint() is not None and not export_active()
     date_label = self._selected_date if isinstance(self._selected_date, str) else ""
 
+    if not can_export:
+      warn = tr("No USB drive mounted")
+      wsize = measure_text_cached(self._small, warn, 34)
+      rl.draw_text_ex(self._small, warn, rl.Vector2(rect.x + rect.width - wsize.x, rect.y), 34, 0, rl.Color(255, 180, 120, 255))
+
     if not date_label:
       # Root: dates only - no camera picker until a date is opened.
-      list_y = rect.y + 110
-      if not can_export:
-        rl.draw_text_ex(self._small, tr("No USB drive mounted"), rl.Vector2(rect.x, rect.y + 70), 34, 0, rl.Color(255, 180, 120, 255))
-      else:
-        rl.draw_text_ex(self._small, tr("Select a date"), rl.Vector2(rect.x, rect.y + 70), 34, 0, SUBTEXT_COLOR)
+      if can_export:
+        rl.draw_text_ex(self._small, tr("Select a date"), rl.Vector2(rect.x, rect.y), 34, 0, SUBTEXT_COLOR)
+      list_y = rect.y + 50
     else:
-      py = rect.y + 90
+      py = rect.y + 50
       pw, ph, gap = 220, 90, 16
       x = rect.x
       for i, btn in enumerate(self._picker):
@@ -1582,8 +1585,6 @@ class DashCamLayout(Widget):
       ctrl_y = py + ph + 18
       self._btn_back.render(rl.Rectangle(rect.x, ctrl_y, 200, 84))
       rl.draw_text_ex(self._font, date_label, rl.Vector2(rect.x + 220, ctrl_y + 12), 48, 0, rl.WHITE)
-      if not can_export:
-        rl.draw_text_ex(self._small, tr("No USB drive mounted"), rl.Vector2(rect.x + 500, ctrl_y + 26), 34, 0, rl.Color(255, 180, 120, 255))
       self._btn_select_all.render(rl.Rectangle(rect.x + rect.width - 580, ctrl_y, 240, 84))
       self._btn_export.set_enabled(can_export and bool(self._selected) and not export_active())
       self._btn_export.render(rl.Rectangle(rect.x + rect.width - 320, ctrl_y, 320, 84))
