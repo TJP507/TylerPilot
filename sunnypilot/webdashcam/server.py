@@ -26,6 +26,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import threading
 import time
 import zlib
 
@@ -441,10 +442,15 @@ async def handle_clip(request: web.Request) -> web.StreamResponse:
     "Content-Disposition": f'{"inline" if inline else "attachment"}; filename="{filename}"',
     "Cache-Control": "no-store",
   })
+  global _ACTIVE_STREAMS
   await response.prepare(request)
-  async for chunk in _mp4_chunks(src):
-    await response.write(chunk)
-  await response.write_eof()
+  _ACTIVE_STREAMS += 1
+  try:
+    async for chunk in _mp4_chunks(src):
+      await response.write(chunk)
+    await response.write_eof()
+  finally:
+    _ACTIVE_STREAMS -= 1
   return response
 
 
@@ -475,13 +481,17 @@ async def handle_zip(request: web.Request) -> web.StreamResponse:
     "Content-Disposition": f'attachment; filename="dashcam_{label}.zip"',
     "Cache-Control": "no-store",
   })
+  global _ACTIVE_STREAMS
   await response.prepare(request)
-
-  zipper = _ZipStream(response)
-  for name, mtime, path in entries:
-    await zipper.add(name, mtime, _mp4_chunks(path))
-  await zipper.finish()
-  await response.write_eof()
+  _ACTIVE_STREAMS += 1
+  try:
+    zipper = _ZipStream(response)
+    for name, mtime, path in entries:
+      await zipper.add(name, mtime, _mp4_chunks(path))
+    await zipper.finish()
+    await response.write_eof()
+  finally:
+    _ACTIVE_STREAMS -= 1
   return response
 
 
@@ -571,37 +581,37 @@ class _ZipStream:
                                     central_size, central_offset, 0))
 
 
+_CERT_SIGNATURE = ""
+_CERT_LAST_SEEN = ""
+_ACTIVE_STREAMS = 0
+
+
 def _cert_sans() -> list[str]:
   """SAN entries so the self-signed cert is valid on the LAN and over Tailscale."""
   sans = ["IP:127.0.0.1", "DNS:localhost"]
-  for ip in config.lan_ips() + config.tailscale_ips():
+  tailscale_ips = config.tailscale_ips()
+  for ip in config.lan_ips() + tailscale_ips:
     entry = f"IP:{ip}"
     if entry not in sans:
       sans.append(entry)
-  for name in config.tailscale_names():
-    entry = f"DNS:{name}"
-    if entry not in sans:
-      sans.append(entry)
+  # Only name the tailnet once Tailscale has an address, otherwise a stale
+  # status file could contribute a name the device is not reachable at.
+  if tailscale_ips:
+    for name in config.tailscale_names():
+      entry = f"DNS:{name}"
+      if entry not in sans:
+        sans.append(entry)
   return sans
 
 
-def _wait_for_address(timeout: float = 60.0, settle: float = 5.0) -> None:
-  """Wait until the address set stops changing before building the certificate.
+def _cert_signature() -> str:
+  return "|".join(_cert_sans())
 
-  Interfaces come up at different times (Tailscale and Wi-Fi), and the cert is
-  only built at startup, so generating too early would omit whatever arrived
-  late (e.g. the LAN address) and browsers would then reject that hostname.
-  """
+
+def _wait_for_address(timeout: float = 90.0) -> None:
+  """Wait until at least one LAN or Tailscale address exists before building the cert."""
   deadline = time.monotonic() + timeout
-  previous = None
-  stable_since = time.monotonic()
-  while time.monotonic() < deadline:
-    current = tuple(_cert_sans())
-    if current != previous:
-      previous = current
-      stable_since = time.monotonic()
-    elif time.monotonic() - stable_since >= settle:
-      break
+  while not (config.lan_ips() or config.tailscale_ips()) and time.monotonic() < deadline:
     time.sleep(1)
 
 
@@ -611,14 +621,12 @@ def _ensure_cert() -> tuple[str, str]:
   SANs cover the LAN address(es) and the Tailscale IP / MagicDNS name so HTTPS
   works no matter which one is used. The cellular address is deliberately
   excluded: it changes constantly and is not reachable from the LAN or tailnet.
-  The certificate is regenerated whenever the set of addresses changes, which is
-  the only way to avoid a hostname mismatch, at the cost of re-accepting the
-  self-signed warning.
   """
+  global _CERT_SIGNATURE, _CERT_LAST_SEEN
   cert, key = config.CERT_PATH, config.KEY_PATH
   _wait_for_address()
   sans = _cert_sans()
-  signature = "|".join(sans)
+  _CERT_SIGNATURE = _CERT_LAST_SEEN = "|".join(sans)
   marker = cert + ".ip"
   try:
     with open(marker) as f:
@@ -626,7 +634,7 @@ def _ensure_cert() -> tuple[str, str]:
   except OSError:
     previous = ""
 
-  if os.path.exists(cert) and os.path.exists(key) and previous == signature:
+  if os.path.exists(cert) and os.path.exists(key) and previous == _CERT_SIGNATURE:
     return cert, key
 
   subprocess.run(
@@ -636,8 +644,25 @@ def _ensure_cert() -> tuple[str, str]:
     check=True, capture_output=True)
   os.chmod(key, 0o600)
   with open(marker, "w") as f:
-    f.write(signature)
+    f.write(_CERT_SIGNATURE)
   return cert, key
+
+
+def _cert_watchdog() -> None:
+  """Restart the server when the address set changes so the TLS cert is rebuilt.
+
+  Interfaces come up and go away (Wi-Fi, Tailscale), and the cert is only built
+  at start, so without this a new address would be rejected as a hostname
+  mismatch until the next reboot. The restart is deferred while a download runs.
+  """
+  global _CERT_LAST_SEEN
+  while True:
+    time.sleep(5)
+    current = _cert_signature()
+    if _ACTIVE_STREAMS == 0 and current == _CERT_LAST_SEEN and current != _CERT_SIGNATURE:
+      print("[webdashcam] address set changed; restarting to rebuild TLS certificate", flush=True)
+      os._exit(0)
+    _CERT_LAST_SEEN = current
 
 
 def main() -> None:
@@ -654,6 +679,7 @@ def main() -> None:
   ])
 
   cert, key = _ensure_cert()
+  threading.Thread(target=_cert_watchdog, daemon=True, name="webdashcam-cert").start()
   ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
   ssl_context.load_cert_chain(cert, key)
   web.run_app(app, host=HOST, port=config.PORT, ssl_context=ssl_context, access_log=None, print=None)
