@@ -585,11 +585,24 @@ def _cert_sans() -> list[str]:
   return sans
 
 
-def _wait_for_address(timeout: float = 45.0) -> None:
-  """Wait until a LAN or Tailscale address exists (the cert needs at least one)."""
+def _wait_for_address(timeout: float = 60.0, settle: float = 5.0) -> None:
+  """Wait until the address set stops changing before building the certificate.
+
+  Interfaces come up at different times (Tailscale and Wi-Fi), and the cert is
+  only built at startup, so generating too early would omit whatever arrived
+  late (e.g. the LAN address) and browsers would then reject that hostname.
+  """
   deadline = time.monotonic() + timeout
-  while not (config.lan_ips() or config.tailscale_ips()) and time.monotonic() < deadline:
-    time.sleep(2)
+  previous = None
+  stable_since = time.monotonic()
+  while time.monotonic() < deadline:
+    current = tuple(_cert_sans())
+    if current != previous:
+      previous = current
+      stable_since = time.monotonic()
+    elif time.monotonic() - stable_since >= settle:
+      break
+    time.sleep(1)
 
 
 def _ensure_cert() -> tuple[str, str]:
