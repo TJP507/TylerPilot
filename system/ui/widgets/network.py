@@ -1,4 +1,3 @@
-import os
 import json
 import time
 from enum import IntEnum
@@ -42,10 +41,6 @@ MIN_PASSWORD_LENGTH = 8
 MAX_PASSWORD_LENGTH = 64
 ITEM_HEIGHT = 160
 ICON_SIZE = 50
-
-# File dropped to ask the modem process to tear down and reinitialize (reread
-# SIM/APN/roaming). Shared with system/hardware/tici/modem.py.
-MODEM_REINIT_FILE = "/data/community/modem_reinit"
 
 STRENGTH_ICONS = [
   "icons/wifi_strength_low.png",
@@ -204,11 +199,6 @@ class CellularSettings(Widget):
     # APN setting
     self._apn_btn = button_item(lambda: tr("APN Setting"), lambda: tr("EDIT"), callback=self._edit_apn)
 
-    # Force the modem to tear down and re-read SIM/APN/roaming. Useful when a
-    # carrier requires a specific APN and the modem is stuck searching.
-    self._reinit_btn = button_item(lambda: tr("Reinitialize Modem"), lambda: tr("RESTART"),
-                                   callback=self._reinitialize_modem)
-
     # Status items
     items: list[Widget] = [
       text_item(lambda: tr("Status"), lambda: self._fmt_state()),
@@ -221,7 +211,6 @@ class CellularSettings(Widget):
       text_item(lambda: tr("Channel"), lambda: str(self._modem_state.get("channel", "N/A"))),
       self._roaming_btn,
       self._apn_btn,
-      self._reinit_btn,
       self._cellular_metered_btn,
       text_item(lambda: tr("IMEI"), lambda: self._modem_state.get("imei", "N/A")),
       text_item(lambda: tr("ICCID"), lambda: self._modem_state.get("iccid", "N/A")),
@@ -280,14 +269,6 @@ class CellularSettings(Widget):
     self._keyboard.set_callback(update_apn)
     gui_app.push_widget(self._keyboard)
 
-  def _reinitialize_modem(self):
-    try:
-      os.makedirs(os.path.dirname(MODEM_REINIT_FILE), exist_ok=True)
-      with open(MODEM_REINIT_FILE, "w"):
-        pass
-    except OSError:
-      pass
-
   def _update_state(self):
     now = time.monotonic()
     if now - self._last_read > 0.5:
@@ -302,7 +283,6 @@ class CellularSettings(Widget):
     self._wifi_manager.set_ipv4_forward(show_cell_settings)
     self._roaming_btn.set_visible(show_cell_settings)
     self._apn_btn.set_visible(show_cell_settings)
-    self._reinit_btn.set_visible(show_cell_settings)
     self._cellular_metered_btn.set_visible(show_cell_settings)
 
   def _render(self, _):
