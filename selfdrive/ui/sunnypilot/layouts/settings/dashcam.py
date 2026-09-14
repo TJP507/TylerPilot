@@ -253,6 +253,27 @@ def segments_on_date(date: str) -> list:
   return out
 
 
+def list_date_counts() -> dict:
+  """Number of finished segments recorded on each date, across all cameras."""
+  counts: dict = {}
+  root = Paths.log_root()
+  try:
+    names = os.listdir(root)
+  except OSError:
+    return counts
+  for name in names:
+    seg_dir = os.path.join(root, name)
+    if "--" not in name or not os.path.isdir(seg_dir):
+      continue
+    if os.path.exists(os.path.join(seg_dir, "rlog.lock")):
+      continue
+    mt = segment_mtime(seg_dir)
+    if mt:
+      date = time.strftime("%Y-%m-%d", time.localtime(mt))
+      counts[date] = counts.get(date, 0) + 1
+  return counts
+
+
 def delete_segments(seg_dirs: list) -> tuple:
   """Delete segment directories under the log root. Returns (deleted, errors)."""
   root = os.path.realpath(Paths.log_root())
@@ -1398,15 +1419,25 @@ class DashCamLayout(Widget):
       return
     self._camera_idx = idx
     self._selected.clear()
-    self._selected_date = None
+    # The picker only exists inside a date, so stay in the current date.
     self._reload()
 
   def _back_to_dates(self) -> None:
     self._selected_date = None
+    self._selected.clear()
     self._reload()
 
   def _open_date(self, date: str) -> None:
     self._selected_date = date
+    self._selected.clear()
+    # Default to a camera that actually has clips that day.
+    if not any(time.strftime("%Y-%m-%d", time.localtime(c.mtime)) == date for c in self._clips):
+      for idx, (_, camera_file) in enumerate(CAMERAS):
+        if idx == self._camera_idx:
+          continue
+        if any(time.strftime("%Y-%m-%d", time.localtime(c.mtime)) == date for c in list_clips(camera_file)):
+          self._camera_idx = idx
+          break
     self._reload()
 
   def _toggle(self, clip: Clip, selected: bool) -> None:
@@ -1430,23 +1461,22 @@ class DashCamLayout(Widget):
     self._reload()
 
   # ---- export ----
-  def _start_export_for(self, clips: list[Clip]) -> None:
-    if export_active() or not clips:
+  def _start_export_segments(self, seg_dirs: list) -> None:
+    if export_active() or not seg_dirs:
       return
     mnt = export_mountpoint()
     if not mnt:
       return
-    segs: dict[str, float] = {}
-    for c in clips:
-      segs[os.path.dirname(c.path)] = c.mtime
+    segs = {d: segment_mtime(d) for d in seg_dirs}
     if start_export(list(segs.items()), mnt):
       gui_app.push_widget(ExportProgressDialog())
 
   def _export_selected(self) -> None:
-    self._start_export_for([c for c in self._clips if c.name in self._selected])
+    dirs = sorted({os.path.dirname(c.path) for c in self._clips if c.name in self._selected})
+    self._start_export_segments(dirs)
 
   def _export_date(self, date: str) -> None:
-    self._start_export_for(self._clips_on_date(date))
+    self._start_export_segments(segments_on_date(date))
 
   # ---- delete ----
   def _confirm_delete(self, text: str, action) -> None:
@@ -1488,12 +1518,10 @@ class DashCamLayout(Widget):
 
     rows: list = []
     if self._selected_date is None:
-      grouped: dict[str, int] = {}
-      for c in self._clips:
-        d = time.strftime("%Y-%m-%d", time.localtime(c.mtime))
-        grouped[d] = grouped.get(d, 0) + 1
-      for d in sorted(grouped.keys(), reverse=True):
-        rows.append(_DateRow(d, grouped[d], can_export, lambda d=d: self._open_date(d),
+      # Root: only dates, counted across every camera.
+      counts = list_date_counts()
+      for d in sorted(counts.keys(), reverse=True):
+        rows.append(_DateRow(d, counts[d], can_export, lambda d=d: self._open_date(d),
                              lambda d=d: self._export_date(d), self._delete_date))
     else:
       for c in self._clips_on_date(self._selected_date):
@@ -1532,18 +1560,26 @@ class DashCamLayout(Widget):
 
     rl.draw_text_ex(self._font, tr("Dash Cam"), rl.Vector2(rect.x, rect.y), 56, 0, rl.WHITE)
 
-    py = rect.y + 90
-    pw, ph, gap = 220, 90, 16
-    x = rect.x
-    for i, btn in enumerate(self._picker):
-      btn.set_button_style(ButtonStyle.PRIMARY if i == self._camera_idx else ButtonStyle.NORMAL)
-      btn.render(rl.Rectangle(x, py, pw, ph))
-      x += pw + gap
-
-    ctrl_y = py + ph + 18
     can_export = export_mountpoint() is not None and not export_active()
     date_label = self._selected_date if isinstance(self._selected_date, str) else ""
-    if date_label:
+
+    if not date_label:
+      # Root: dates only - no camera picker until a date is opened.
+      list_y = rect.y + 110
+      if not can_export:
+        rl.draw_text_ex(self._small, tr("No USB drive mounted"), rl.Vector2(rect.x, rect.y + 70), 34, 0, rl.Color(255, 180, 120, 255))
+      else:
+        rl.draw_text_ex(self._small, tr("Select a date"), rl.Vector2(rect.x, rect.y + 70), 34, 0, SUBTEXT_COLOR)
+    else:
+      py = rect.y + 90
+      pw, ph, gap = 220, 90, 16
+      x = rect.x
+      for i, btn in enumerate(self._picker):
+        btn.set_button_style(ButtonStyle.PRIMARY if i == self._camera_idx else ButtonStyle.NORMAL)
+        btn.render(rl.Rectangle(x, py, pw, ph))
+        x += pw + gap
+
+      ctrl_y = py + ph + 18
       self._btn_back.render(rl.Rectangle(rect.x, ctrl_y, 200, 84))
       rl.draw_text_ex(self._font, date_label, rl.Vector2(rect.x + 220, ctrl_y + 12), 48, 0, rl.WHITE)
       if not can_export:
@@ -1551,13 +1587,8 @@ class DashCamLayout(Widget):
       self._btn_select_all.render(rl.Rectangle(rect.x + rect.width - 580, ctrl_y, 240, 84))
       self._btn_export.set_enabled(can_export and bool(self._selected) and not export_active())
       self._btn_export.render(rl.Rectangle(rect.x + rect.width - 320, ctrl_y, 320, 84))
-    else:
-      if not can_export:
-        rl.draw_text_ex(self._small, tr("No USB drive mounted"), rl.Vector2(rect.x, ctrl_y + 26), 34, 0, rl.Color(255, 180, 120, 255))
-      else:
-        rl.draw_text_ex(self._small, tr("Select a date to view or export its clips"), rl.Vector2(rect.x, ctrl_y + 26), 34, 0, SUBTEXT_COLOR)
+      list_y = ctrl_y + 84 + 22
 
-    list_y = ctrl_y + 84 + 22
     list_rect = rl.Rectangle(rect.x, list_y, rect.width, rect.height - (list_y - rect.y))
     if self._has_rows:
       self._scroller.render(list_rect)
