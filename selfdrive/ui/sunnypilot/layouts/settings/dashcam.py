@@ -217,7 +217,15 @@ def export_mountpoint():
 
 def segment_cameras(seg_dir: str) -> list:
   return [(CAMERA_FOLDER[file], os.path.join(seg_dir, file)) for _, file in CAMERAS
-          if os.path.isfile(os.path.join(seg_dir, file))]
+          if _has_video_data(os.path.join(seg_dir, file))]
+
+
+def _has_video_data(path: str) -> bool:
+  """A camera file is exportable only if it exists and actually contains data."""
+  try:
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+  except OSError:
+    return False
 
 
 def segment_mtime(seg_dir: str) -> float:
