@@ -876,6 +876,13 @@ class DashCamPlayer(NavWidget):
     if ui_state.started:
       self._playing = False
       self.dismiss()
+      return
+    # Keep the screen awake (and the settings open) while a video is actively
+    # playing. Once paused, let the normal interactive timeout close the player.
+    if self._playing:
+      eof = self._decoder is not None and self._decoder.snapshot()[6]
+      if not eof:
+        device._reset_interactive_timeout()
 
   # ---- rendering ----
   def _render(self, rect: rl.Rectangle) -> None:
