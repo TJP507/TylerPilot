@@ -180,6 +180,24 @@ def external_storage_usage():
     return _SNAPSHOT["external_usage"]
 
 
+def _set_mounted(disk: str, mountpoint: str) -> None:
+  """Record a just-completed mount change immediately so the UI updates at once.
+
+  Enumerating a freshly mounted drive can block for seconds, so the row would
+  otherwise show stale state until the next background refresh reconciles it.
+  """
+  with _SNAPSHOT_LOCK:
+    entries = []
+    for name, size, entry in _SNAPSHOT["entries"]:
+      entry = dict(entry)
+      if name == disk:
+        entry["mountpoint"] = mountpoint
+      entries.append((name, size, entry))
+    first_mounted = next((e for _n, _s, e in entries if e.get("mountpoint")), None)
+    _SNAPSHOT.update(entries=entries, first_mounted=first_mounted,
+                     revision=_SNAPSHOT["revision"] + 1)
+
+
 def _automount_loop() -> None:
   known: set = set()
   while True:
@@ -625,10 +643,12 @@ class ExternalStoragePanel(NavWidget):
       return
     if mounted:
       self._run_action(unmount_partition, entry, tr("Unmounting") + f" {entry['path']}",
-                       tr("Unmounted") + f" {entry['path']}", tr("Unmounting drive"))
+                       tr("Unmounted") + f" {entry['path']}", tr("Unmounting drive"),
+                       on_success=lambda: _set_mounted(entry["name"], ""))
     else:
       self._run_action(mount_partition, entry, tr("Mounting") + f" {entry['path']}",
-                       tr("Mounted") + f" {entry['path']}", tr("Mounting drive"))
+                       tr("Mounted") + f" {entry['path']}", tr("Mounting drive"),
+                       on_success=lambda: _set_mounted(entry["name"], os.path.join(MOUNT_ROOT, entry["name"])))
 
   def confirm_format_drive(self, disk: str) -> None:
     if operation_active():
@@ -637,12 +657,13 @@ class ExternalStoragePanel(NavWidget):
     def cb(result: int):
       if result == DialogResult.CONFIRM:
         self._run_action(format_whole_drive, disk, tr("Formatting") + f" /dev/{disk}",
-                         tr("Formatted") + f" /dev/{disk}", tr("Formatting storage"))
+                         tr("Formatted") + f" /dev/{disk}", tr("Formatting storage"),
+                         on_success=lambda: _set_mounted(disk, ""))
 
     msg = tr("Are you sure you want to delete all of the data on this device?")
     gui_app.push_widget(ConfirmDialog(msg, tr("Format Storage"), callback=cb, confirm_style=ButtonStyle.DANGER))
 
-  def _run_action(self, fn, arg, start_label: str, done_label: str, title: str, *args) -> None:
+  def _run_action(self, fn, arg, start_label: str, done_label: str, title: str, *args, on_success=None) -> None:
     with _OP_LOCK:
       if _OP["active"]:
         return
@@ -658,6 +679,11 @@ class ExternalStoragePanel(NavWidget):
         ok, err = fn(arg, *args)
       except Exception as e:  # noqa: BLE001 - report, never crash the UI
         ok, err = False, str(e)
+      if ok and on_success is not None:
+        try:
+          on_success()
+        except Exception:  # noqa: BLE001
+          pass
       with _OP_LOCK:
         _OP["active"] = False
         _OP["progress"] = 1.0
