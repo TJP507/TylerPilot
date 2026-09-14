@@ -93,16 +93,35 @@ def daemon_running() -> bool:
   return status_json() is not None
 
 
+def _daemon_process_present() -> bool:
+  for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+      continue
+    try:
+      with open(os.path.join("/proc", pid, "cmdline"), "rb") as f:
+        raw = f.read()
+    except OSError:
+      continue
+    parts = [p.decode(errors="ignore") for p in raw.split(b"\x00") if p]
+    if parts and os.path.basename(parts[0]) == "tailscaled":
+      return True
+  return False
+
+
 def start_daemon() -> bool:
   if daemon_running():
     return True
-  started = _spawn([ts_config.TAILSCALED_BIN, f"--state={ts_config.TS_STATE}", f"--socket={ts_config.TS_SOCKET}",
-                    "--tun=tailscale0", "--port=41641"])
-  if not started:
-    return False
-  for _ in range(20):
+  # Never spawn a second daemon: two instances racing over the state file churn
+  # the machine key. If one is already coming up, just wait for its socket.
+  if not _daemon_process_present():
+    if not _spawn([ts_config.TAILSCALED_BIN, f"--state={ts_config.TS_STATE}", f"--socket={ts_config.TS_SOCKET}",
+                   "--tun=tailscale0", "--port=41641"]):
+      return False
+  for _ in range(60):
     if daemon_running():
       return True
+    if not _daemon_process_present():
+      return False
     time.sleep(0.25)
   return daemon_running()
 
@@ -296,7 +315,11 @@ def tick() -> None:
     state["dns_name"] = str(self_node.get("DNSName") or "")
     state["ips"] = [ip for ip in (st.get("TailscaleIPs") or []) if ip]
 
-    if enabled and not state["auth_url"] and not _up_in_flight() and state["backend_state"] in ("Stopped", "NoState", "NeedsLogin"):
+    # Only ever start an interactive login from a settled NeedsLogin/Stopped
+    # state. Doing it during the boot-time NoState window makes `up` regenerate
+    # the node key before the saved profile is loaded, forcing a re-login every
+    # boot. A registered node never passes through NeedsLogin, so this is safe.
+    if enabled and state["backend_state"] in ("NeedsLogin", "Stopped") and not state["auth_url"] and not _up_in_flight():
       start_login(hostname)
   elif not enabled:
     # Disabled and the daemon is not reachable: make sure it is fully stopped.
