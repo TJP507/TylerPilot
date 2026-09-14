@@ -26,7 +26,7 @@ STATE_PATH = os.path.join(STATE_DIR, "webdashcam.json")
 CERT_PATH = os.path.join(STATE_DIR, "webdashcam.crt")
 KEY_PATH = os.path.join(STATE_DIR, "webdashcam.key")
 DEFAULT_USER = "admin"
-PORT = 8081
+PORT = 8443
 
 PASSWORD_LENGTH = 8
 # Letters and numbers only. Ambiguous characters (0/O, 1/l/I) are dropped so the
