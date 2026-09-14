@@ -23,6 +23,10 @@ AT_PORT = "/dev/modem_at0"
 PPP_PORT = "/dev/modem_at1"
 STATE_PATH = "/dev/shm/modem"
 AT_LOCK = "/dev/shm/modem.lock"  # shared with LPA
+# The UI drops this file to ask the modem to tear down and reinitialize (re-read
+# SIM/APN/roaming). Params can't be used for this: adding new param keys needs a
+# rebuild, and this trigger has no persisted value anyway.
+REINIT_FILE = "/data/community/modem_reinit"
 AT_INIT = [
   "ATE0",       # disable command echo
   "ATV1",       # verbose result codes (CONNECT/BUSY/NO CARRIER, not numeric)
@@ -402,7 +406,7 @@ class Modem:
     if self._ppp.has_exited():
       return self._handle_pppd_exit()
 
-    if self._sim_change or not os.path.exists(AT_PORT) or self._params_changed():
+    if self._sim_change or not os.path.exists(AT_PORT):
       return State.DISCONNECTING
 
     self._poll()
@@ -548,6 +552,21 @@ class Modem:
     while self.running:
       try:
         self._check_iccid(state)
+
+        # React to APN/roaming edits and reinitialize requests from any state, not
+        # just while CONNECTED. Otherwise an APN typed in while the modem is still
+        # SEARCHING/CONNECTING is never applied.
+        if state not in (State.INITIALIZING, State.DISCONNECTING):
+          if os.path.exists(REINIT_FILE):
+            try:
+              os.remove(REINIT_FILE)
+            except OSError:
+              pass
+            logging.info("reinitialize requested")
+            state = State.DISCONNECTING
+          elif self._params_changed():
+            state = State.DISCONNECTING
+
         prev = state
         state = handlers[state]()
         if state != prev:
