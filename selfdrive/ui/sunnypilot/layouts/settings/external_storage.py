@@ -105,6 +105,64 @@ def _dismiss_active_panel() -> None:
 # appears. Manual unmounts stay unmounted until the drive is replugged.
 _AUTOMOUNT_STARTED = False
 
+# Enumeration (lsblk/findmnt, and waking a spun-down drive) can block for several
+# seconds, so it must never run on the UI thread. A background loop keeps this
+# snapshot fresh; the UI only ever reads it.
+_SNAPSHOT_LOCK = threading.Lock()
+_SNAPSHOT: dict = {"entries": [], "first_mounted": None, "revision": 0}
+_REFRESHING = threading.Event()
+REFRESH_INTERVAL = 3.0
+
+
+def _collect() -> tuple:
+  """Enumerate external drives. Blocking: background threads only."""
+  entries: list = []
+  first_mounted = None
+  for disk in list_external():
+    entry = _drive_mount_entry(disk)
+    if entry is None:
+      continue
+    entries.append((disk, _disk_size(disk), entry))
+    if first_mounted is None and entry.get("mountpoint"):
+      first_mounted = entry
+  return entries, first_mounted
+
+
+def refresh_external() -> None:
+  """Re-enumerate and publish a new snapshot. Blocking: background threads only."""
+  entries, first_mounted = _collect()
+  with _SNAPSHOT_LOCK:
+    _SNAPSHOT.update(entries=entries, first_mounted=first_mounted,
+                     revision=_SNAPSHOT["revision"] + 1)
+
+
+def request_refresh() -> None:
+  """Ask for a fresh enumeration without ever blocking the caller."""
+  if _REFRESHING.is_set():
+    return
+  _REFRESHING.set()
+
+  def worker():
+    try:
+      refresh_external()
+    except Exception:
+      pass
+    finally:
+      _REFRESHING.clear()
+
+  threading.Thread(target=worker, daemon=True, name="external_refresh").start()
+
+
+def external_entries() -> tuple:
+  """(revision, [(disk, size, entry), ...]) from the last snapshot."""
+  with _SNAPSHOT_LOCK:
+    return _SNAPSHOT["revision"], list(_SNAPSHOT["entries"])
+
+
+def external_revision() -> int:
+  with _SNAPSHOT_LOCK:
+    return _SNAPSHOT["revision"]
+
 
 def _automount_loop() -> None:
   known: set = set()
@@ -116,9 +174,10 @@ def _automount_loop() -> None:
         if entry is not None and not entry.get("mountpoint"):
           mount_partition(entry)
       known = present
+      refresh_external()
     except Exception:
       pass
-    time.sleep(5)
+    time.sleep(REFRESH_INTERVAL)
 
 
 def start_automount() -> None:
@@ -373,12 +432,9 @@ def _drive_mount_entry(disk: str) -> dict:
 
 
 def first_mounted_external():
-  """Return the mount entry of the first mounted external drive, or None."""
-  for disk in list_external():
-    entry = _drive_mount_entry(disk)
-    if entry is not None and entry.get("mountpoint"):
-      return entry
-  return None
+  """Cached mount entry of the first mounted external drive, or None. Never blocks."""
+  with _SNAPSHOT_LOCK:
+    return _SNAPSHOT["first_mounted"]
 
 
 class _DriveRow(Widget):
@@ -401,6 +457,10 @@ class _DriveRow(Widget):
     self._btn_toggle = self._child(Button(tr("Mount"), lambda: panel.toggle_mount(entry), font_size=40))
     self._btn_fat = self._child(Button(tr("Format Storage"), lambda: panel.confirm_format_drive(disk),
                                        font_size=40, button_style=ButtonStyle.DANGER))
+
+  def update_entry(self, size: int, entry: dict) -> None:
+    self._size = size
+    self._entry = entry
 
   def set_parent_rect(self, parent_rect: rl.Rectangle) -> None:
     super().set_parent_rect(parent_rect)
@@ -495,10 +555,9 @@ class ExternalStoragePanel(NavWidget):
     self._small = gui_app.font(FontWeight.NORMAL)
     self._scroller = Scroller([], spacing=16, line_separator=False, pad_end=True)
     self._rows: list = []
-    self._reload_pending = False
-    self._seen_revision = operation_status()["revision"]
+    self._seen_snapshot_rev = -1
     self._btn_back = self._child(Button(tr("Back"), lambda: self.dismiss(), font_size=40))
-    self._btn_rescan = self._child(Button(tr("Rescan"), self._reload, font_size=40))
+    self._btn_rescan = self._child(Button(tr("Rescan"), self._rescan, font_size=40))
 
     global _TIMEOUT_CB_REGISTERED
     if not _TIMEOUT_CB_REGISTERED:
@@ -515,7 +574,7 @@ class ExternalStoragePanel(NavWidget):
     super().show_event()
     global _ACTIVE_PANEL
     _ACTIVE_PANEL = self
-    self._reload()
+    self._rescan()
 
   def hide_event(self) -> None:
     super().hide_event()
@@ -523,14 +582,21 @@ class ExternalStoragePanel(NavWidget):
     if _ACTIVE_PANEL is self:
       _ACTIVE_PANEL = None
 
-  def _reload(self) -> None:
-    rows: list = []
-    for disk in list_external():
-      rows.append(_DriveRow(disk, _disk_size(disk), _drive_mount_entry(disk), self))
-    self._scroller = Scroller(rows, spacing=16, line_separator=False, pad_end=True)
-    self._scroller.show_event()
-    self._rows = rows
-    self._seen_revision = operation_status()["revision"]
+  def _rescan(self) -> None:
+    request_refresh()
+    self._sync_rows()
+
+  def _sync_rows(self) -> None:
+    """Rebuild the rows from the cached snapshot. Never enumerates on this thread."""
+    revision, entries = external_entries()
+    if [disk for disk, _size, _entry in entries] != [row._disk for row in self._rows]:
+      self._rows = [_DriveRow(disk, size, entry, self) for disk, size, entry in entries]
+      self._scroller = Scroller(self._rows, spacing=16, line_separator=False, pad_end=True)
+      self._scroller.show_event()
+    else:
+      for row, (_disk, size, entry) in zip(self._rows, entries):
+        row.update_entry(size, entry)
+    self._seen_snapshot_rev = revision
 
   # ---- actions ----
   def toggle_mount(self, entry: dict) -> None:
@@ -568,7 +634,6 @@ class ExternalStoragePanel(NavWidget):
       _OP["result"] = ""
       _OP["failed"] = False
       _OP["progress"] = 0.0
-      self._seen_revision = _OP["revision"]
 
     def worker():
       try:
@@ -581,6 +646,7 @@ class ExternalStoragePanel(NavWidget):
         _OP["result"] = done_label if ok else f"{tr('Failed')}: {err or 'unknown error'}"
         _OP["failed"] = not ok
         _OP["revision"] += 1
+      request_refresh()
 
     threading.Thread(target=worker, daemon=True).start()
     gui_app.push_widget(StorageProgressDialog())
@@ -588,11 +654,8 @@ class ExternalStoragePanel(NavWidget):
   # ---- render ----
   def _update_state(self) -> None:
     super()._update_state()
-    if operation_status()["revision"] != self._seen_revision:
-      self._reload_pending = True
-    if self._reload_pending and not operation_active():
-      self._reload_pending = False
-      self._reload()
+    if external_revision() != self._seen_snapshot_rev:
+      self._sync_rows()
 
   def _render(self, rect: rl.Rectangle) -> None:
     if not ui_state.is_offroad():
