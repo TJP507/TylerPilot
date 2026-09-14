@@ -189,6 +189,9 @@ procs += [
 
   # web dash cam (password protected downloads over the local network, parked only)
   PythonProcess("webdashcam", "sunnypilot.webdashcam.server", and_(only_offroad, use_webdashcam), enabled=not PC, restart_if_crash=True),
+
+  # tailscale remote access (keeps the daemon alive and publishes status for the settings UI)
+  PythonProcess("tailscale", "sunnypilot.tailscale.manager", always_run, enabled=not PC, restart_if_crash=True),
 ]
 
 if os.path.exists("./github_runner.sh"):

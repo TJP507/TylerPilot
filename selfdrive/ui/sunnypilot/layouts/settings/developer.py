@@ -11,6 +11,7 @@ from pathlib import Path
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.layouts.settings.developer import DeveloperLayout
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.external_storage import ExternalStoragePanel
+from openpilot.selfdrive.ui.sunnypilot.layouts.settings.tailscale import TailscalePanel
 from openpilot.system.hardware import PC
 from openpilot.system.hardware.hw import Paths
 from openpilot.system.ui.lib.application import gui_app
@@ -57,11 +58,19 @@ class DeveloperLayoutSP(DeveloperLayout):
                                             tr("Mount, unmount or format USB drives connected to the device. Formatting erases all data."),
                                             callback=self._on_external_storage_clicked)
 
+    self.tailscale_btn = button_item(tr("Tailscale"), tr("OPEN"),
+                                     tr("Connect this device to your Tailscale tailnet for remote access. " +
+                                        "Scan the QR code to register the device."),
+                                     callback=self._on_tailscale_clicked)
+
     self.items: list = [self.show_advanced_controls, self.enable_github_runner_toggle, self.enable_copyparty_toggle, self.prebuilt_toggle,
-                        self.error_log_btn, self.external_storage_btn,]
+                        self.error_log_btn, self.external_storage_btn, self.tailscale_btn,]
 
   def _on_external_storage_clicked(self):
     gui_app.push_widget(ExternalStoragePanel())
+
+  def _on_tailscale_clicked(self):
+    gui_app.push_widget(TailscalePanel())
 
   @staticmethod
   def _on_prebuilt_toggled(state):
