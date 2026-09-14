@@ -70,6 +70,7 @@ class TailscalePanel(NavWidget):
     self._btn_back = self._child(Button(tr("Back"), lambda: self.dismiss(), font_size=40))
     self._btn_primary = self._child(Button(tr("Connect"), lambda: self._connect(), font_size=40, button_style=ButtonStyle.PRIMARY))
     self._btn_secondary = self._child(Button(tr("Disable"), lambda: self._disable(), font_size=40))
+    self._btn_logout = self._child(Button(tr("Log out"), lambda: self._log_out(), font_size=40))
 
     global _TIMEOUT_CB_REGISTERED
     if not _TIMEOUT_CB_REGISTERED:
@@ -273,6 +274,8 @@ class TailscalePanel(NavWidget):
     elif not enabled:
       buttons.append((self._btn_primary, tr("Enable"), self._enable, ButtonStyle.PRIMARY, True))
     else:
+      if running:
+        buttons.append((self._btn_logout, tr("Log out"), self._log_out, ButtonStyle.NORMAL, True))
       buttons.append((self._btn_secondary, tr("Disable"), self._disable, ButtonStyle.NORMAL, True))
       if running:
         buttons.append((self._btn_primary, tr("Disconnect"), self._disconnect, ButtonStyle.NORMAL, True))
