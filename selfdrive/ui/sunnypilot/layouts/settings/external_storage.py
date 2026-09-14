@@ -470,7 +470,9 @@ class _DriveRow(Widget):
     self._font = gui_app.font(FontWeight.MEDIUM)
     self._small = gui_app.font(FontWeight.NORMAL)
 
-    self._btn_toggle = self._child(Button(tr("Mount"), lambda: panel.toggle_mount(entry), font_size=40))
+    # Read self._entry at click time, not the dict captured here: update_entry()
+    # swaps in a fresh snapshot after each mount/unmount.
+    self._btn_toggle = self._child(Button(tr("Mount"), lambda: panel.toggle_mount(self._entry), font_size=40))
     self._btn_fat = self._child(Button(tr("Format Storage"), lambda: panel.confirm_format_drive(disk),
                                        font_size=40, button_style=ButtonStyle.DANGER))
 
