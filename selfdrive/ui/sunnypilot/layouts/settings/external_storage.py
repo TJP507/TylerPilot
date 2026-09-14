@@ -39,6 +39,10 @@ FORMAT_LABEL = "EXTDATA"
 DISK_RE = re.compile(r"^(?:sd[a-z]+|mmcblk\d+|nvme\d+n\d+)$")
 PARTITION_RE = re.compile(r"^(?:sd[a-z]+\d+|mmcblk\d+p\d+|nvme\d+n\d+p\d+)$")
 
+# Filesystems the device kernel can mount for an external data drive. Anything
+# else (exFAT, NTFS, unformatted) must be reformatted before it can be mounted.
+MOUNTABLE_FS = {"vfat", "msdos", "ext2", "ext3", "ext4"}
+
 TEXT_COLOR = rl.Color(255, 255, 255, 255)
 SUBTEXT_COLOR = rl.Color(170, 170, 170, 255)
 WARN_COLOR = rl.Color(255, 180, 120, 255)
@@ -315,6 +319,8 @@ def mount_partition(entry: dict) -> tuple:
   # via mount options; real filesystems get chowned after mounting.
   uid, gid = os.getuid(), os.getgid()
   fstype = _fs_type(entry["path"]).lower()
+  if fstype and fstype not in MOUNTABLE_FS:
+    return False, f"unsupported filesystem {fstype}"
   opts = ["nodev", "nosuid"]
   if fstype in ("vfat", "msdos", "exfat"):
     opts += [f"uid={uid}", f"gid={gid}", "umask=000"]
@@ -389,14 +395,19 @@ class _DriveRow(Widget):
     rl.draw_rectangle_rounded(rect, 0.08, 8, rl.Color(58, 40, 40, 255))
 
     mounted = bool(e["mountpoint"]) or os.path.ismount(os.path.join(MOUNT_ROOT, self._disk))
+    fstype = (e.get("fstype") or "").lower()
+    mountable = fstype in MOUNTABLE_FS
     title = f"/dev/{self._disk}   {_human_size(self._size)}"
     rl.draw_text_ex(self._font, title, rl.Vector2(rect.x + 40, rect.y + 26), 44, 0, TEXT_COLOR)
 
     if mounted:
       mp = e["mountpoint"] or os.path.join(MOUNT_ROOT, self._disk)
       rl.draw_text_ex(self._small, tr("Mounted at") + f" {mp}", rl.Vector2(rect.x + 40, rect.y + 92), 34, 0, GOOD_COLOR)
-    else:
+    elif mountable:
       rl.draw_text_ex(self._small, tr("Not mounted"), rl.Vector2(rect.x + 40, rect.y + 92), 34, 0, SUBTEXT_COLOR)
+    else:
+      hint = tr("Unsupported filesystem") + f" ({fstype or tr('unformatted')}) - " + tr("format FAT32 first")
+      rl.draw_text_ex(self._small, hint, rl.Vector2(rect.x + 40, rect.y + 92), 34, 0, WARN_COLOR)
     rl.draw_text_ex(self._small, tr("Formatting erases the partition table and all data on this drive."),
                     rl.Vector2(rect.x + 40, rect.y + 140), 30, 0, WARN_COLOR)
 
@@ -407,7 +418,8 @@ class _DriveRow(Widget):
     x = rect.x + rect.width - total_w - 40
     y = rect.y + (rect.height - self.BTN_H) / 2
     for btn in (self._btn_toggle, self._btn_fat):
-      btn.set_enabled(not busy)
+      # Mount stays disabled until the drive has a filesystem we can actually mount.
+      btn.set_enabled(not busy and (mounted or mountable or btn is self._btn_fat))
       btn.render(rl.Rectangle(x, y, self.BTN_W, self.BTN_H))
       x += self.BTN_W + self.GAP
 
@@ -463,6 +475,8 @@ class ExternalStoragePanel(NavWidget):
     if operation_active():
       return
     mounted = bool(entry["mountpoint"]) or os.path.ismount(os.path.join(MOUNT_ROOT, entry["name"]))
+    if not mounted and (entry.get("fstype") or "").lower() not in MOUNTABLE_FS:
+      return
     if mounted:
       self._run_action(unmount_partition, entry, tr("Unmounting") + f" {entry['path']}", tr("Unmounted") + f" {entry['path']}")
     else:
