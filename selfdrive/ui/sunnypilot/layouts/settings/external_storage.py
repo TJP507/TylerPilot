@@ -42,6 +42,26 @@ SUBTEXT_COLOR = rl.Color(170, 170, 170, 255)
 WARN_COLOR = rl.Color(255, 180, 120, 255)
 GOOD_COLOR = rl.Color(140, 220, 140, 255)
 
+# Operation state lives at module scope so it survives the panel being closed
+# and reopened while a format/mount is still running in the background.
+_OP_LOCK = threading.Lock()
+_OP: dict = {"active": False, "label": "", "result": "", "failed": False, "revision": 0}
+
+
+def operation_active() -> bool:
+  with _OP_LOCK:
+    return _OP["active"]
+
+
+def operation_status() -> tuple:
+  with _OP_LOCK:
+    return _OP["active"], _OP["label"], _OP["result"], _OP["failed"], _OP["revision"]
+
+
+def _draw_spinner(cx: float, cy: float, radius: float, color: rl.Color) -> None:
+  start = (rl.get_time() * 320.0) % 360.0
+  rl.draw_ring(rl.Vector2(cx, cy), radius - 10, radius, start, start + 250.0, 40, color)
+
 
 def _run(cmd: list, timeout: float = 20.0) -> subprocess.CompletedProcess:
   try:
@@ -306,11 +326,13 @@ class _DriveRow(Widget):
                     rl.Vector2(rect.x + 40, rect.y + 140), 30, 0, WARN_COLOR)
 
     self._btn_toggle.set_text(tr("Unmount") if mounted else tr("Mount"))
+    busy = operation_active()
     n = 3
     total_w = n * self.BTN_W + (n - 1) * self.GAP
     x = rect.x + rect.width - total_w - 40
     y = rect.y + (rect.height - self.BTN_H) / 2
     for btn in (self._btn_toggle, self._btn_ext4, self._btn_fat):
+      btn.set_enabled(not busy)
       btn.render(rl.Rectangle(x, y, self.BTN_W, self.BTN_H))
       x += self.BTN_W + self.GAP
 
@@ -324,10 +346,8 @@ class ExternalStoragePanel(NavWidget):
     self._small = gui_app.font(FontWeight.NORMAL)
     self._scroller = Scroller([], spacing=16, line_separator=False, pad_end=True)
     self._rows: list = []
-    self._status = ""
     self._reload_pending = False
-    self._busy = False
-    self._lock = threading.Lock()
+    self._seen_revision = operation_status()[4]
     self._btn_back = self._child(Button(tr("Back"), lambda: self.dismiss(), font_size=40))
     self._btn_rescan = self._child(Button(tr("Rescan"), self._reload, font_size=40))
 
@@ -348,49 +368,60 @@ class ExternalStoragePanel(NavWidget):
     self._scroller = Scroller(rows, spacing=16, line_separator=False, pad_end=True)
     self._scroller.show_event()
     self._rows = rows
-
-  def _set_status(self, text: str, failed: bool = False) -> None:
-    with self._lock:
-      self._status = ("! " if failed else "") + text
+    self._seen_revision = operation_status()[4]
 
   # ---- actions ----
   def toggle_mount(self, entry: dict) -> None:
-    if self._busy:
+    if operation_active():
       return
     mounted = bool(entry["mountpoint"]) or os.path.ismount(os.path.join(MOUNT_ROOT, entry["name"]))
-    self._run_action(unmount_partition if mounted else mount_partition, entry,
-                     tr("Unmounted") + f" {entry['path']}" if mounted else tr("Mounted") + f" {entry['path']}")
+    if mounted:
+      self._run_action(unmount_partition, entry, tr("Unmounting") + f" {entry['path']}", tr("Unmounted") + f" {entry['path']}")
+    else:
+      self._run_action(mount_partition, entry, tr("Mounting") + f" {entry['path']}", tr("Mounted") + f" {entry['path']}")
 
   def confirm_format_drive(self, disk: str, fs: str) -> None:
-    if self._busy:
+    if operation_active():
       return
 
     def cb(result: int):
       if result == DialogResult.CONFIRM:
-        self._run_action(format_whole_drive, disk, tr("Formatted drive") + f" /dev/{disk} ({fs})", fs)
+        self._run_action(format_whole_drive, disk, tr("Formatting") + f" /dev/{disk} ({fs})",
+                         tr("Formatted") + f" /dev/{disk} ({fs})", fs)
 
     msg = (tr("Erase ALL partitions and data on") + f" /dev/{disk} " +
            tr("and format the entire drive as") + f" {fs}?")
     gui_app.push_widget(ConfirmDialog(msg, tr("Format drive"), callback=cb))
 
-  def _run_action(self, fn, entry: dict, ok_msg: str, *args) -> None:
-    self._busy = True
-    self._set_status(tr("Working..."))
+  def _run_action(self, fn, arg, start_label: str, done_label: str, *args) -> None:
+    with _OP_LOCK:
+      if _OP["active"]:
+        return
+      _OP["active"] = True
+      _OP["label"] = start_label + "..."
+      _OP["result"] = ""
+      _OP["failed"] = False
+      self._seen_revision = _OP["revision"]
 
     def worker():
       try:
-        ok, err = fn(entry, *args)
-        self._set_status(ok_msg if ok else f"{tr('Failed')}: {err or 'unknown error'}", failed=not ok)
-      finally:
-        self._busy = False
-        self._reload_pending = True
+        ok, err = fn(arg, *args)
+      except Exception as e:  # noqa: BLE001 - report, never crash the UI
+        ok, err = False, str(e)
+      with _OP_LOCK:
+        _OP["active"] = False
+        _OP["result"] = done_label if ok else f"{tr('Failed')}: {err or 'unknown error'}"
+        _OP["failed"] = not ok
+        _OP["revision"] += 1
 
     threading.Thread(target=worker, daemon=True).start()
 
   # ---- render ----
   def _update_state(self) -> None:
     super()._update_state()
-    if self._reload_pending and not self._busy:
+    if operation_status()[4] != self._seen_revision:
+      self._reload_pending = True
+    if self._reload_pending and not operation_active():
       self._reload_pending = False
       self._reload()
 
@@ -407,10 +438,16 @@ class ExternalStoragePanel(NavWidget):
     rl.draw_text_ex(self._small, info, rl.Vector2(rect.x, rect.y + 110), 34, 0, SUBTEXT_COLOR)
     warn = tr("Formatting permanently erases data. ext4 is recommended; FAT32 is limited to 4 GB files.")
     rl.draw_text_ex(self._small, warn, rl.Vector2(rect.x, rect.y + 152), 34, 0, WARN_COLOR)
-    with self._lock:
-      status = self._status
-    if status:
-      rl.draw_text_ex(self._small, status, rl.Vector2(rect.x, rect.y + 194), 34, 0, TEXT_COLOR)
+
+    active, label, result, failed, _ = operation_status()
+    line = label if active else result
+    if line:
+      color = WARN_COLOR if active else (rl.RED if failed else GOOD_COLOR)
+      text_x = rect.x
+      if active:
+        _draw_spinner(rect.x + 18, rect.y + 197, 18, color)
+        text_x = rect.x + 52
+      rl.draw_text_ex(self._small, line, rl.Vector2(text_x, rect.y + 180), 34, 0, color)
 
     list_y = rect.y + 240
     list_rect = rl.Rectangle(rect.x, list_y, rect.width, max(rect.height - (list_y - rect.y), 0))
