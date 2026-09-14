@@ -35,7 +35,7 @@ import pyray as rl
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.system.hardware.hw import Paths
-from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.selfdrive.ui.ui_state import ui_state, device
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -100,6 +100,16 @@ PANEL_BG = rl.Color(41, 41, 41, 255)
 ROW_BG = rl.Color(41, 41, 41, 255)
 ROW_BG_PRESSED = rl.Color(74, 74, 74, 255)
 SUBTEXT_COLOR = rl.Color(170, 170, 170, 255)
+
+_ACTIVE_PLAYER = None  # set while a DashCamPlayer is on the nav stack
+_TIMEOUT_CB_REGISTERED = False
+
+
+def _dismiss_active_player() -> None:
+  # The settings menu closes itself on the interactive timeout, but a pushed
+  # player widget would otherwise be left on screen. Close it gracefully too.
+  if _ACTIVE_PLAYER is not None:
+    _ACTIVE_PLAYER.graceful_close()
 
 
 @dataclass
@@ -514,9 +524,7 @@ class _HardwareDecoder(threading.Thread):
     _dbg("session start", start_idx, "img", self._img_w, self._img_h)
 
     frames_read = 0
-    pace_frames = 0
-    pace_time = time.monotonic()
-    was_playing = False
+    next_frame_time = 0.0
     while not session_stop.is_set() and not self._stop_ev.is_set():
       playing = self._play_ev.is_set()
       with self._lock:
@@ -526,10 +534,15 @@ class _HardwareDecoder(threading.Thread):
       if not playing and flush_target < 0:
         time.sleep(0.02)
         continue
-      if playing and not was_playing:
-        pace_frames = frames_read
-        pace_time = time.monotonic()
-      was_playing = playing
+
+      if playing:
+        # Honor an absolute per-frame deadline. Clamping a stale deadline means
+        # a pause never builds a backlog that would fast-forward on resume.
+        now = time.monotonic()
+        next_frame_time = max(next_frame_time, now)
+        delay = next_frame_time - now
+        if delay > 0:
+          time.sleep(delay)
 
       ready, _, _ = select.select([proc.stdout], [], [], 0.05)
       if not ready:
@@ -560,10 +573,8 @@ class _HardwareDecoder(threading.Thread):
         _dbg("frames_read", frames_read)
 
       if playing:
-        # Pace playback to the recording frame rate (hardware decode is faster).
-        drift = ((frames_read - pace_frames) / PLAYER_FPS) - (time.monotonic() - pace_time)
-        if drift > 0:
-          time.sleep(drift)
+        # Advance the deadline by exactly one frame period.
+        next_frame_time += 1.0 / PLAYER_FPS
       else:
         # Paused seek: once the requested frame is on screen, hold it.
         with self._lock:
@@ -764,9 +775,16 @@ class DashCamPlayer(NavWidget):
     self._btn_next = self._child(_IconButton("icons/next.png", self._next_clip))
     self._btn_close = self._child(_IconButton("icons/close2.png", lambda: self.dismiss(), button_style=ButtonStyle.DANGER))
 
+    global _TIMEOUT_CB_REGISTERED
+    if not _TIMEOUT_CB_REGISTERED:
+      device.add_interactive_timeout_callback(_dismiss_active_player)
+      _TIMEOUT_CB_REGISTERED = True
+
   # ---- lifecycle ----
   def show_event(self) -> None:
     super().show_event()
+    global _ACTIVE_PLAYER
+    _ACTIVE_PLAYER = self
     if self._shader is None:
       self._shader = rl.load_shader_from_memory(YUV_VERTEX_SHADER, YUV_FRAGMENT_SHADER)
       self._tex1_loc = rl.get_shader_location(self._shader, "texture1")
@@ -774,8 +792,19 @@ class DashCamPlayer(NavWidget):
 
   def hide_event(self) -> None:
     super().hide_event()
+    global _ACTIVE_PLAYER
+    if _ACTIVE_PLAYER is self:
+      _ACTIVE_PLAYER = None
     self._stop_decoder()
     self._unload_textures()
+
+  def graceful_close(self) -> None:
+    """Pause and animate the player away (used by the interactive timeout)."""
+    self._playing = False
+    if self._decoder is not None:
+      self._decoder.set_playing(False)
+    self._btn_play.set_icon("icons/play.png")
+    self.dismiss()
 
   def _unload_textures(self) -> None:
     if self._tex_y is not None:
