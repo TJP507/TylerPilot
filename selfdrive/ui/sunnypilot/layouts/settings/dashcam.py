@@ -8,8 +8,7 @@ On-device dash cam browser and simple video player.
 
 Recordings live in Paths.log_root() (/data/media/0/realdata) as one directory per
 60 second segment (<route>--<segment>). Each segment contains raw HEVC elementary
-streams (fcamera.hevc / ecamera.hevc / dcamera.hevc) plus an H.264/TS cabin stream
-(qcamera.ts).
+streams (fcamera.hevc / ecamera.hevc / dcamera.hevc).
 
 Raw HEVC has no container timestamps, so seeking is done through openpilot's HEVC
 index (frame -> byte offset). On comma 3X the Qualcomm msm_vidc hardware decoder
@@ -92,7 +91,6 @@ CAMERAS = [
   ("Front", "fcamera.hevc"),
   ("Wide", "ecamera.hevc"),
   ("Driver", "dcamera.hevc"),
-  ("Cabin", "qcamera.ts"),
 ]
 
 DISPLAY_W = 960
@@ -176,7 +174,7 @@ FFMPEG = "/usr/local/venv/bin/ffmpeg"
 EXPORT_DIR_NAME = "tylerpilot"
 SEGMENT_SECONDS = 60.0
 # camera file -> export subfolder on the USB drive
-CAMERA_FOLDER = {"fcamera.hevc": "front", "ecamera.hevc": "wide", "dcamera.hevc": "driver", "qcamera.ts": "cabin"}
+CAMERA_FOLDER = {"fcamera.hevc": "front", "ecamera.hevc": "wide", "dcamera.hevc": "driver"}
 
 _EXPORT_LOCK = threading.Lock()
 _EXPORT: dict = {"active": False, "done": 0, "total": 0, "fraction": 0.0, "current": "",
@@ -484,6 +482,15 @@ class _SoftwareDecoder(threading.Thread):
     while not self._play_ev.is_set() and not self._stop_ev.is_set():
       time.sleep(0.02)
 
+  def _pace(self, next_frame_time: float) -> float:
+    """Block until the next frame is due, then return the following deadline."""
+    now = time.monotonic()
+    next_frame_time = max(next_frame_time, now)
+    delay = next_frame_time - now
+    if delay > 0:
+      time.sleep(delay)
+    return next_frame_time + 1.0 / PLAYER_FPS
+
   def _wait_for_seek_or_stop(self) -> None:
     while not self._stop_ev.is_set():
       with self._lock:
@@ -540,6 +547,7 @@ class _SoftwareDecoder(threading.Thread):
       self._total = len(frames)
 
     gop_idx = 0
+    next_frame_time = 0.0
     while not self._stop_ev.is_set():
       seek = self._take_seek()
       if seek is not None:
@@ -589,6 +597,10 @@ class _SoftwareDecoder(threading.Thread):
           if self._stop_ev.is_set():
             container.close()
             return
+        if seeking:
+          next_frame_time = time.monotonic()
+        else:
+          next_frame_time = self._pace(next_frame_time)
         self._publish(frame, frame_base + emitted)
         emitted += 1
         seeking = False
@@ -622,6 +634,7 @@ class _SoftwareDecoder(threading.Thread):
           pass
 
       seeking = seek is not None
+      next_frame_time = 0.0
       for frame in container.decode(stream):
         if self._stop_ev.is_set():
           container.close()
@@ -633,6 +646,10 @@ class _SoftwareDecoder(threading.Thread):
           if self._stop_ev.is_set():
             container.close()
             return
+        if seeking:
+          next_frame_time = time.monotonic()
+        else:
+          next_frame_time = self._pace(next_frame_time)
         t = frame.time if frame.time is not None else 0.0
         self._publish(frame, int(t * fps))
         seeking = False
