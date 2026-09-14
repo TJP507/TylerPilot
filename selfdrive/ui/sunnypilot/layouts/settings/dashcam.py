@@ -441,18 +441,18 @@ class _HardwareDecoder(threading.Thread):
     def feed():
       i = start_idx
       normal = False
-      fed_any = False
+      fed_count = 0
       try:
         with open(self._path, "rb") as fh:
           while i < len(frames) and not self._stop_ev.is_set():
             with self._lock:
               if self._seek_to is not None:
                 return
-            if not self._play_ev.is_set():
-              if fed_any:
-                time.sleep(0.02)
-                continue
-              # Paused: feed a single frame so a seek target is visible, then hold.
+            if not self._play_ev.is_set() and fed_count >= 12:
+              time.sleep(0.02)
+              continue
+            # While paused, feed a short burst so the pipeline flushes and a
+            # seek target actually becomes visible, then hold.
             _key, pos, size = frames[i]
             fh.seek(pos)
             data = fh.read(size)
@@ -463,7 +463,7 @@ class _HardwareDecoder(threading.Thread):
             except (BrokenPipeError, OSError, ValueError):
               return
             i += 1
-            fed_any = True
+            fed_count += 1
           normal = i >= len(frames) and not self._stop_ev.is_set()
       finally:
         _dbg("feed end at", i, "normal", normal)
