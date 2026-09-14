@@ -41,10 +41,13 @@ SESSION_TTL = 60 * 60 * 24 * 30
 _SESSION_MESSAGE = b"webdashcam-session-v1"
 
 # The server binds every interface, but a request is only served when it arrives
-# on one of these. Cellular data interfaces (rmnet*, wwan*) are deliberately
-# absent, so the dash cam UI can never be reached over 4G/LTE: such connections
-# are refused before authentication, and no page or clip is ever sent.
-ALLOWED_INTERFACE_PREFIXES = ("lo", "wlan", "p2p", "ap", "usb", "rndis", "eth")
+# on one of these. Cellular data interfaces (rmnet*, wwan*, ppp*) are deliberately
+# absent, so the dash cam UI can never be reached directly over 4G/LTE: such
+# connections are refused before authentication, and no page or clip is ever sent.
+# The Tailscale interface is allowed, but a download over it is confirmed in the
+# browser first, since the device may be using metered LTE as its uplink.
+ALLOWED_INTERFACE_PREFIXES = ("lo", "wlan", "p2p", "ap", "usb", "rndis", "eth", "tailscale")
+CELLULAR_INTERFACE_PREFIXES = ("ppp", "rmnet", "wwan")
 
 _IFACE_CACHE = {"at": -1.0, "by_ip": {}}
 _DENIED_SEEN: set = set()
@@ -70,13 +73,47 @@ def _interface_for_ip(ip: str) -> str | None:
   return _IFACE_CACHE["by_ip"].get(ip)
 
 
-def _request_allowed(request: web.Request) -> bool:
-  """True only when the connection arrived on a Wi-Fi/tether interface."""
+def _local_interface(request: web.Request) -> str | None:
+  """Interface the accepted connection arrived on, or None if unknown."""
   transport = request.transport
   sockname = transport.get_extra_info("sockname") if transport is not None else None
   if not sockname:
-    return False
-  name = _interface_for_ip(sockname[0])
+    return None
+  return _interface_for_ip(sockname[0])
+
+
+def _over_tailscale(request: web.Request) -> bool:
+  name = _local_interface(request)
+  return name is not None and name.startswith("tailscale")
+
+
+def _primary_interface() -> str | None:
+  """Interface carrying the lowest-metric IPv4 default route, or None."""
+  best_iface, best_metric = None, None
+  try:
+    with open("/proc/net/route") as f:
+      next(f, None)
+      for line in f:
+        fields = line.split()
+        if len(fields) < 8 or fields[1] != "00000000":
+          continue
+        iface, metric = fields[0], int(fields[6])
+        if best_metric is None or metric < best_metric:
+          best_iface, best_metric = iface, metric
+  except (OSError, ValueError):
+    return None
+  return best_iface
+
+
+def _on_cellular() -> bool:
+  """True while the device's default route is a cellular interface."""
+  iface = _primary_interface()
+  return iface is not None and iface.startswith(CELLULAR_INTERFACE_PREFIXES)
+
+
+def _request_allowed(request: web.Request) -> bool:
+  """True only when the connection arrived on an allowed interface."""
+  name = _local_interface(request)
   if name is not None and _allowed_interface(name):
     return True
   if name is not None and name not in _DENIED_SEEN:
@@ -146,10 +183,17 @@ main{padding:12px;max-width:900px;margin:0 auto;padding-bottom:96px}
 </div>
 <script>
 const CAMLABEL={front:"Front",wide:"Wide",driver:"Driver"};
+const OVER_TAILSCALE=__OVER_TAILSCALE__;
+const ON_CELLULAR=__ON_CELLULAR__;
+const DL_WARN=ON_CELLULAR
+  ? "This device is on cellular (LTE) right now. Downloading over Tailscale will use a LOT of mobile data. Continue?"
+  : "This download goes over Tailscale. If the device is using an LTE connection it will use a LOT of mobile data. Continue?";
 const state={dates:[],date:null,clips:[],cam:"all",sel:new Set()};
 const $=(s)=>document.querySelector(s);
 const fmt=(b)=>b>=1073741824?(b/1073741824).toFixed(2)+" GB":b>=1048576?(b/1048576).toFixed(1)+" MB":Math.round(b/1024)+" KB";
 async function api(path){const r=await fetch(path);if(r.status===401){location.href="/login";throw new Error("auth");}if(!r.ok)throw new Error(r.status);return r.json();}
+function guardDownload(url){if(OVER_TAILSCALE&&!confirm(DL_WARN))return;location.href=url;}
+function wireDownload(el){el.onclick=(e)=>{e.preventDefault();guardDownload(el.getAttribute("href"));};}
 
 async function loadDates(){
   state.date=null;state.clips=[];state.sel.clear();state.cam="all";
@@ -171,6 +215,7 @@ function renderDates(){
       <div class="meta">${d.count} clip(s)</div></div>
       <a class="btn" href="/zip?date=${d.date}">Download day</a>`;
     row.querySelector(".open").onclick=()=>openDate(d.date);
+    wireDownload(row.querySelector("a.btn"));
     el.appendChild(row);
   }
 }
@@ -215,6 +260,7 @@ function renderClips(){
       a.href=`/clip/${encodeURIComponent(c.seg)}/${cam}`;
       a.textContent=(cams.length>1?(CAMLABEL[cam]+" "):"")+"\\u2193";
       a.style.marginLeft="6px";
+      wireDownload(a);
       acts.appendChild(a);
     }
     row.querySelector(".check").onclick=()=>{state.sel.has(c.seg)?state.sel.delete(c.seg):state.sel.add(c.seg);renderClips();};
@@ -235,7 +281,7 @@ function updateBar(){
 function download(onlySelected){
   let url=`/zip?date=${encodeURIComponent(state.date)}&cams=${camList().join(",")}`;
   if(onlySelected)url+="&segs="+[...state.sel].map(encodeURIComponent).join(",");
-  window.location.href=url;
+  guardDownload(url);
 }
 
 loadDates().catch(e=>{if(e.message!=="auth"){$("#sub").textContent="Error: "+e.message;}});
@@ -309,8 +355,11 @@ async def auth_middleware(request: web.Request, handler):
   return web.Response(status=401, text="Authentication required.")
 
 
-async def handle_index(_request: web.Request) -> web.Response:
-  return web.Response(text=INDEX_HTML, content_type="text/html")
+async def handle_index(request: web.Request) -> web.Response:
+  html = (INDEX_HTML
+          .replace("__OVER_TAILSCALE__", "true" if _over_tailscale(request) else "false")
+          .replace("__ON_CELLULAR__", "true" if _on_cellular() else "false"))
+  return web.Response(text=html, content_type="text/html")
 
 
 async def handle_login_get(_request: web.Request) -> web.Response:
