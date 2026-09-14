@@ -1418,9 +1418,10 @@ class DashCamLayout(Widget):
 
     ctrl_y = py + ph + 18
     can_export = export_mountpoint() is not None and not export_active()
-    if self._selected_date is not None:
+    date_label = self._selected_date if isinstance(self._selected_date, str) else ""
+    if date_label:
       self._btn_back.render(rl.Rectangle(rect.x, ctrl_y, 200, 84))
-      rl.draw_text_ex(self._font, self._selected_date, rl.Vector2(rect.x + 220, ctrl_y + 12), 48, 0, rl.WHITE)
+      rl.draw_text_ex(self._font, date_label, rl.Vector2(rect.x + 220, ctrl_y + 12), 48, 0, rl.WHITE)
       if not can_export:
         rl.draw_text_ex(self._small, tr("No USB drive mounted"), rl.Vector2(rect.x + 500, ctrl_y + 26), 34, 0, rl.Color(255, 180, 120, 255))
       self._btn_select_all.render(rl.Rectangle(rect.x + rect.width - 580, ctrl_y, 240, 84))
