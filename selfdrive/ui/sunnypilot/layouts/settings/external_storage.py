@@ -22,6 +22,7 @@ import time
 import pyray as rl
 
 from openpilot.selfdrive.ui.ui_state import ui_state, device
+from openpilot.system.hardware import PC
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -82,6 +83,37 @@ def _dismiss_active_panel() -> None:
     gui_app.pop_widget()
   if gui_app.get_active_widget() is panel:
     gui_app.pop_widget()
+
+
+# Auto-mount: the OS automount rule targets /mnt/sdcard, which cannot exist on
+# this read-only rootfs, so a supported drive plugged in at boot (or inserted
+# later) would otherwise never be mounted. The UI process runs for the whole
+# session, so watch for external drives here and mount each one once when it
+# appears. Manual unmounts stay unmounted until the drive is replugged.
+_AUTOMOUNT_STARTED = False
+
+
+def _automount_loop() -> None:
+  known: set = set()
+  while True:
+    try:
+      present = set(list_external())
+      for disk in present - known:
+        entry = _drive_mount_entry(disk)
+        if entry is not None and not entry.get("mountpoint"):
+          mount_partition(entry)
+      known = present
+    except Exception:
+      pass
+    time.sleep(5)
+
+
+def start_automount() -> None:
+  global _AUTOMOUNT_STARTED
+  if _AUTOMOUNT_STARTED or PC:
+    return
+  _AUTOMOUNT_STARTED = True
+  threading.Thread(target=_automount_loop, daemon=True, name="external_automount").start()
 
 
 def _run(cmd: list, timeout: float = 20.0) -> subprocess.CompletedProcess:

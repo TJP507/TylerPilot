@@ -9,6 +9,7 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.layouts.main import MainLayout
 from openpilot.selfdrive.ui.mici.layouts.main import MiciMainLayout
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.selfdrive.ui.sunnypilot.layouts.settings.external_storage import start_automount
 
 BIG_UI = gui_app.big_ui()
 
@@ -19,6 +20,7 @@ def main():
   config_realtime_process(0, Priority.CTRL_HIGH)
 
   gui_app.init_window("UI")
+  start_automount()
   if BIG_UI:
     MainLayout()
   else:
