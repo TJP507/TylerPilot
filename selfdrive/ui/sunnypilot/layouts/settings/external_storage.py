@@ -39,7 +39,6 @@ PARTITION_RE = re.compile(r"^(?:sd[a-z]+\d+|mmcblk\d+p\d+|nvme\d+n\d+p\d+)$")
 
 TEXT_COLOR = rl.Color(255, 255, 255, 255)
 SUBTEXT_COLOR = rl.Color(170, 170, 170, 255)
-ROW_BG = rl.Color(41, 41, 41, 255)
 WARN_COLOR = rl.Color(255, 180, 120, 255)
 GOOD_COLOR = rl.Color(140, 220, 140, 255)
 
@@ -250,82 +249,40 @@ def unmount_partition(entry: dict) -> tuple:
   return r.returncode == 0, (r.stderr or r.stdout).strip()
 
 
-def format_partition(entry: dict, fs: str) -> tuple:
-  """Unmount, then create a fresh filesystem. ext4 or vfat only."""
-  if not _is_external_path(entry["path"]):
-    return False, "refusing to format non-external device"
-  if not (PARTITION_RE.match(entry["name"]) or entry["is_disk"]):
-    return False, "refusing to format unexpected device"
-  _run(["sudo", "umount", entry["mountpoint"] or entry["path"]])
-  if fs == "ext4":
-    cmd = ["sudo", "mkfs.ext4", "-F", "-L", FORMAT_LABEL, entry["path"]]
-  elif fs == "vfat":
-    cmd = ["sudo", "mkfs.vfat", "-F", "32", "-n", FORMAT_LABEL, entry["path"]]
+def _drive_mount_entry(disk: str) -> dict:
+  """Mount target for a drive: its first partition, or the disk if unpartitioned."""
+  parts = [e for e in _disk_entries(disk) if not e.get("is_disk")]
+  if parts:
+    entry = dict(parts[0])
   else:
-    return False, f"unsupported filesystem {fs}"
-  r = _run(cmd, timeout=180.0)
-  return r.returncode == 0, (r.stderr or r.stdout).strip()
+    entry = {"name": disk, "path": f"/dev/{disk}", "size": _disk_size(disk), "fstype": "",
+             "label": "", "mountpoint": "", "is_disk": True}
+  entry["name"] = disk  # mount at /data/external/<disk>
+  entry["mountpoint"] = _mountpoint_of(entry["path"])
+  return entry
 
 
 class _DriveRow(Widget):
-  """Whole-drive row: wipes the partition table and creates one partition."""
+  """One row per external drive: mount/unmount and whole-drive format."""
 
-  HEIGHT = 210
-  BTN_W = 330
+  HEIGHT = 230
+  BTN_W = 300
   BTN_H = 96
   GAP = 20
 
-  def __init__(self, disk: str, size: int, panel: "ExternalStoragePanel"):
+  def __init__(self, disk: str, size: int, entry: dict, panel: "ExternalStoragePanel"):
     super().__init__()
     self._disk = disk
     self._size = size
-    self._rect = rl.Rectangle(0, 0, 0, self.HEIGHT)
-    self._font = gui_app.font(FontWeight.MEDIUM)
-    self._small = gui_app.font(FontWeight.NORMAL)
-
-    self._btn_ext4 = self._child(Button(tr("Format drive ext4"), lambda: panel.confirm_format_drive(disk, "ext4"),
-                                        font_size=40, button_style=ButtonStyle.DANGER))
-    self._btn_fat = self._child(Button(tr("Format drive FAT32"), lambda: panel.confirm_format_drive(disk, "vfat"),
-                                       font_size=40, button_style=ButtonStyle.DANGER))
-
-  def set_parent_rect(self, parent_rect: rl.Rectangle) -> None:
-    super().set_parent_rect(parent_rect)
-    self._rect.width = parent_rect.width
-
-  def _render(self, rect: rl.Rectangle) -> None:
-    rl.draw_rectangle_rounded(rect, 0.08, 8, rl.Color(58, 40, 40, 255))
-    title = f"/dev/{self._disk}   {_human_size(self._size)}   -   " + tr("entire drive")
-    rl.draw_text_ex(self._font, title, rl.Vector2(rect.x + 40, rect.y + 30), 44, 0, TEXT_COLOR)
-    rl.draw_text_ex(self._small, tr("Erases the partition table and all partitions on this drive."),
-                    rl.Vector2(rect.x + 40, rect.y + 96), 34, 0, WARN_COLOR)
-
-    n = 2
-    total_w = n * self.BTN_W + (n - 1) * self.GAP
-    x = rect.x + rect.width - total_w - 40
-    y = rect.y + (rect.height - self.BTN_H) / 2
-    for btn in (self._btn_ext4, self._btn_fat):
-      btn.render(rl.Rectangle(x, y, self.BTN_W, self.BTN_H))
-      x += self.BTN_W + self.GAP
-
-
-class _PartitionRow(Widget):
-  HEIGHT = 250
-  BTN_W = 260
-  BTN_H = 96
-  GAP = 20
-
-  def __init__(self, entry: dict, panel: "ExternalStoragePanel"):
-    super().__init__()
     self._entry = entry
-    self._panel = panel
     self._rect = rl.Rectangle(0, 0, 0, self.HEIGHT)
     self._font = gui_app.font(FontWeight.MEDIUM)
     self._small = gui_app.font(FontWeight.NORMAL)
 
     self._btn_toggle = self._child(Button(tr("Mount"), lambda: panel.toggle_mount(entry), font_size=40))
-    self._btn_ext4 = self._child(Button(tr("Format ext4"), lambda: panel.confirm_format(entry, "ext4"),
+    self._btn_ext4 = self._child(Button(tr("Format ext4"), lambda: panel.confirm_format_drive(disk, "ext4"),
                                         font_size=40, button_style=ButtonStyle.DANGER))
-    self._btn_fat = self._child(Button(tr("Format FAT32"), lambda: panel.confirm_format(entry, "vfat"),
+    self._btn_fat = self._child(Button(tr("Format FAT32"), lambda: panel.confirm_format_drive(disk, "vfat"),
                                        font_size=40, button_style=ButtonStyle.DANGER))
 
   def set_parent_rect(self, parent_rect: rl.Rectangle) -> None:
@@ -334,21 +291,19 @@ class _PartitionRow(Widget):
 
   def _render(self, rect: rl.Rectangle) -> None:
     e = self._entry
-    rl.draw_rectangle_rounded(rect, 0.08, 8, ROW_BG)
+    rl.draw_rectangle_rounded(rect, 0.08, 8, rl.Color(58, 40, 40, 255))
 
-    mounted = bool(e["mountpoint"]) or os.path.ismount(os.path.join(MOUNT_ROOT, e["name"]))
-    title = f"{e['path']}   {_human_size(e['size'])}   {e['fstype'] or tr('unformatted')}"
-    if e["label"]:
-      title += f"   [{e['label']}]"
+    mounted = bool(e["mountpoint"]) or os.path.ismount(os.path.join(MOUNT_ROOT, self._disk))
+    title = f"/dev/{self._disk}   {_human_size(self._size)}   -   " + tr("entire drive")
     rl.draw_text_ex(self._font, title, rl.Vector2(rect.x + 40, rect.y + 26), 44, 0, TEXT_COLOR)
 
     if mounted:
-      mp = e["mountpoint"] or os.path.join(MOUNT_ROOT, e["name"])
+      mp = e["mountpoint"] or os.path.join(MOUNT_ROOT, self._disk)
       rl.draw_text_ex(self._small, tr("Mounted at") + f" {mp}", rl.Vector2(rect.x + 40, rect.y + 92), 34, 0, GOOD_COLOR)
     else:
       rl.draw_text_ex(self._small, tr("Not mounted"), rl.Vector2(rect.x + 40, rect.y + 92), 34, 0, SUBTEXT_COLOR)
-    if e["is_disk"]:
-      rl.draw_text_ex(self._small, tr("whole disk (no partition table)"), rl.Vector2(rect.x + 40, rect.y + 138), 30, 0, WARN_COLOR)
+    rl.draw_text_ex(self._small, tr("Formatting erases the partition table and all data on this drive."),
+                    rl.Vector2(rect.x + 40, rect.y + 140), 30, 0, WARN_COLOR)
 
     self._btn_toggle.set_text(tr("Unmount") if mounted else tr("Mount"))
     n = 3
@@ -373,7 +328,13 @@ class ExternalStoragePanel(NavWidget):
     self._reload_pending = False
     self._busy = False
     self._lock = threading.Lock()
+    self._btn_back = self._child(Button(tr("Back"), lambda: self.dismiss(), font_size=40))
     self._btn_rescan = self._child(Button(tr("Rescan"), self._reload, font_size=40))
+
+  # Back navigation is via the on-screen Back button only: swipe-to-dismiss
+  # fights with list scrolling, so disable the NavWidget gesture entirely.
+  def _back_enabled(self) -> bool:
+    return False
 
   # ---- lifecycle ----
   def show_event(self) -> None:
@@ -383,21 +344,10 @@ class ExternalStoragePanel(NavWidget):
   def _reload(self) -> None:
     rows: list = []
     for disk in list_external():
-      rows.append(_DriveRow(disk, _disk_size(disk), self))
-      for entry in _disk_entries(disk):
-        entry["mountpoint"] = entry["mountpoint"] or _mountpoint_of(entry["path"])
-        rows.append(_PartitionRow(entry, self))
+      rows.append(_DriveRow(disk, _disk_size(disk), _drive_mount_entry(disk), self))
     self._scroller = Scroller(rows, spacing=16, line_separator=False, pad_end=True)
     self._scroller.show_event()
     self._rows = rows
-
-  def _back_enabled(self) -> bool:
-    # Only swipe-away when the list is scrolled to the top, otherwise a
-    # downward drag must scroll the list instead of dismissing the panel.
-    try:
-      return self._scroller.scroll_panel.offset >= -20
-    except Exception:
-      return True
 
   def _set_status(self, text: str, failed: bool = False) -> None:
     with self._lock:
@@ -410,17 +360,6 @@ class ExternalStoragePanel(NavWidget):
     mounted = bool(entry["mountpoint"]) or os.path.ismount(os.path.join(MOUNT_ROOT, entry["name"]))
     self._run_action(unmount_partition if mounted else mount_partition, entry,
                      tr("Unmounted") + f" {entry['path']}" if mounted else tr("Mounted") + f" {entry['path']}")
-
-  def confirm_format(self, entry: dict, fs: str) -> None:
-    if self._busy:
-      return
-
-    def cb(result: int):
-      if result == DialogResult.CONFIRM:
-        self._run_action(format_partition, entry, tr("Formatted") + f" {entry['path']} ({fs})", fs)
-
-    msg = tr("Erase ALL data on") + f" {entry['path']} " + tr("and format it as") + f" {fs}?"
-    gui_app.push_widget(ConfirmDialog(msg, tr("Format"), callback=cb))
 
   def confirm_format_drive(self, disk: str, fs: str) -> None:
     if self._busy:
@@ -460,20 +399,20 @@ class ExternalStoragePanel(NavWidget):
       self._draw_center(rect, tr("External storage tools are only available while parked"))
       return
 
-    rl.draw_text_ex(self._font, tr("External Storage"), rl.Vector2(rect.x, rect.y), 56, 0, TEXT_COLOR)
+    self._btn_back.render(rl.Rectangle(rect.x, rect.y, 200, 84))
+    self._btn_rescan.render(rl.Rectangle(rect.x + rect.width - 240, rect.y, 240, 84))
+    rl.draw_text_ex(self._font, tr("External Storage"), rl.Vector2(rect.x + 240, rect.y + 8), 56, 0, TEXT_COLOR)
 
     info = tr("USB drives are mounted under") + f" {MOUNT_ROOT}/<device>."
-    rl.draw_text_ex(self._small, info, rl.Vector2(rect.x, rect.y + 68), 34, 0, SUBTEXT_COLOR)
+    rl.draw_text_ex(self._small, info, rl.Vector2(rect.x, rect.y + 110), 34, 0, SUBTEXT_COLOR)
     warn = tr("Formatting permanently erases data. ext4 is recommended; FAT32 is limited to 4 GB files.")
-    rl.draw_text_ex(self._small, warn, rl.Vector2(rect.x, rect.y + 110), 34, 0, WARN_COLOR)
+    rl.draw_text_ex(self._small, warn, rl.Vector2(rect.x, rect.y + 152), 34, 0, WARN_COLOR)
     with self._lock:
       status = self._status
     if status:
-      rl.draw_text_ex(self._small, status, rl.Vector2(rect.x, rect.y + 152), 34, 0, TEXT_COLOR)
+      rl.draw_text_ex(self._small, status, rl.Vector2(rect.x, rect.y + 194), 34, 0, TEXT_COLOR)
 
-    self._btn_rescan.render(rl.Rectangle(rect.x + rect.width - 240, rect.y - 4, 240, 90))
-
-    list_y = rect.y + 200
+    list_y = rect.y + 240
     list_rect = rl.Rectangle(rect.x, list_y, rect.width, max(rect.height - (list_y - rect.y), 0))
     if self._rows:
       self._scroller.render(list_rect)
