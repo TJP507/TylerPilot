@@ -12,6 +12,7 @@ from openpilot.sunnypilot.mapd.mapd_manager import MAPD_PATH
 
 from openpilot.sunnypilot.models.helpers import get_active_model_runner
 from openpilot.sunnypilot.sunnylink.utils import sunnylink_need_register, sunnylink_ready, use_sunnylink_uploader
+from openpilot.sunnypilot.webdashcam import config as webdashcam_config
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
 
@@ -70,6 +71,9 @@ def use_github_runner(started, params, CP: car.CarParams) -> bool:
 
 def use_copyparty(started, params, CP: car.CarParams) -> bool:
   return bool(params.get_bool("EnableCopyparty"))
+
+def use_webdashcam(started, params, CP: car.CarParams) -> bool:
+  return (not PC) and webdashcam_config.get_enabled()
 
 def sunnylink_ready_shim(started, params, CP: car.CarParams) -> bool:
   """Shim for sunnylink_ready to match the process manager signature."""
@@ -182,6 +186,9 @@ procs += [
 
   # locationd
   NativeProcess("locationd_llk", "sunnypilot/selfdrive/locationd", ["./locationd"], only_onroad),
+
+  # web dash cam (password protected downloads over the local network, parked only)
+  PythonProcess("webdashcam", "sunnypilot.webdashcam.server", and_(only_offroad, use_webdashcam), enabled=not PC, restart_if_crash=True),
 ]
 
 if os.path.exists("./github_runner.sh"):

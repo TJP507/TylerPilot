@@ -22,21 +22,21 @@ import fcntl
 import io
 import os
 import select
-import shutil
 import struct
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
 
 import numpy as np
 import pyray as rl
 
 from openpilot.common.basedir import BASEDIR
-from openpilot.system.hardware.hw import Paths
 from openpilot.selfdrive.ui.ui_state import ui_state, device
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.external_storage import first_mounted_external
+from openpilot.sunnypilot.webdashcam.library import CAMERAS, FFMPEG, PLAYER_FPS, SEGMENT_SECONDS, \
+                                                       Clip, list_clips, list_date_counts, segments_on_date, \
+                                                       segment_mtime, segment_cameras, delete_segments
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -86,16 +86,8 @@ void main() {
 }
 """
 
-# (display name, file name inside each segment)
-CAMERAS = [
-  ("Front", "fcamera.hevc"),
-  ("Wide", "ecamera.hevc"),
-  ("Driver", "dcamera.hevc"),
-]
-
 DISPLAY_W = 960
 DISPLAY_H = 600
-PLAYER_FPS = 20.0  # openpilot records 1200 frames per 60s segment
 
 PANEL_BG = rl.Color(41, 41, 41, 255)
 ROW_BG = rl.Color(41, 41, 41, 255)
@@ -116,65 +108,15 @@ def _dismiss_active_player() -> None:
     _ACTIVE_PLAYER.graceful_close()
 
 
-@dataclass
-class Clip:
-  path: str
-  name: str
-  segment: int
-  mtime: float
-
-  @property
-  def date_text(self) -> str:
-    return time.strftime("%b %d, %Y", time.localtime(self.mtime))
-
-  @property
-  def time_text(self) -> str:
-    return time.strftime("%I:%M:%S %p", time.localtime(self.mtime))
-
-
 def _fmt_time(seconds: float) -> str:
   s = max(0, int(seconds))
   return f"{s // 60:02d}:{s % 60:02d}"
 
 
-def list_clips(camera_file: str) -> list[Clip]:
-  """Enumerate finished segments that contain the requested camera stream, newest first."""
-  clips: list[Clip] = []
-  root = Paths.log_root()
-  try:
-    names = os.listdir(root)
-  except OSError:
-    return clips
-
-  for name in names:
-    seg_dir = os.path.join(root, name)
-    if not os.path.isdir(seg_dir):
-      continue
-    # Skip segments still being written
-    if os.path.exists(os.path.join(seg_dir, "rlog.lock")):
-      continue
-    path = os.path.join(seg_dir, camera_file)
-    if not os.path.isfile(path):
-      continue
-    try:
-      mtime = os.path.getmtime(path)
-    except OSError:
-      continue
-    _, _, seg = name.rpartition("--")
-    clips.append(Clip(path, name, int(seg) if seg.isdigit() else 0, mtime))
-
-  clips.sort(key=lambda c: c.mtime, reverse=True)
-  return clips
-
-
 # ---------------------------------------------------------------------------
 # Export: remux a segment's cameras to .mp4 on a mounted USB drive.
 # ---------------------------------------------------------------------------
-FFMPEG = "/usr/local/venv/bin/ffmpeg"
 EXPORT_DIR_NAME = "tylerpilot"
-SEGMENT_SECONDS = 60.0
-# camera file -> export subfolder on the USB drive
-CAMERA_FOLDER = {"fcamera.hevc": "front", "ecamera.hevc": "wide", "dcamera.hevc": "driver"}
 
 _EXPORT_LOCK = threading.Lock()
 _EXPORT: dict = {"active": False, "done": 0, "total": 0, "fraction": 0.0, "current": "",
@@ -211,98 +153,6 @@ def export_mountpoint():
     entry = first_mounted_external()
     _MOUNT_CACHE["mp"] = entry.get("mountpoint") if entry else None
   return _MOUNT_CACHE["mp"]
-
-
-def segment_cameras(seg_dir: str) -> list:
-  return [(CAMERA_FOLDER[file], os.path.join(seg_dir, file)) for _, file in CAMERAS
-          if _has_video_data(os.path.join(seg_dir, file))]
-
-
-def _has_video_data(path: str) -> bool:
-  """A camera file is exportable only if it exists and actually contains data."""
-  try:
-    return os.path.isfile(path) and os.path.getsize(path) > 0
-  except OSError:
-    return False
-
-
-def segment_mtime(seg_dir: str) -> float:
-  mt = 0.0
-  for _, file in CAMERAS:
-    path = os.path.join(seg_dir, file)
-    if os.path.isfile(path):
-      try:
-        mt = max(mt, os.path.getmtime(path))
-      except OSError:
-        pass
-  if mt == 0.0:
-    try:
-      mt = os.path.getmtime(seg_dir)
-    except OSError:
-      mt = 0.0
-  return mt
-
-
-def segments_on_date(date: str) -> list:
-  """Every finished segment directory (any camera) recorded on `date`."""
-  out: list = []
-  root = Paths.log_root()
-  try:
-    names = os.listdir(root)
-  except OSError:
-    return out
-  for name in names:
-    seg_dir = os.path.join(root, name)
-    if "--" not in name or not os.path.isdir(seg_dir):
-      continue
-    if os.path.exists(os.path.join(seg_dir, "rlog.lock")):
-      continue
-    mt = segment_mtime(seg_dir)
-    if mt and time.strftime("%Y-%m-%d", time.localtime(mt)) == date:
-      out.append(seg_dir)
-  return out
-
-
-def list_date_counts() -> dict:
-  """Number of finished segments recorded on each date, across all cameras."""
-  counts: dict = {}
-  root = Paths.log_root()
-  try:
-    names = os.listdir(root)
-  except OSError:
-    return counts
-  for name in names:
-    seg_dir = os.path.join(root, name)
-    if "--" not in name or not os.path.isdir(seg_dir):
-      continue
-    if os.path.exists(os.path.join(seg_dir, "rlog.lock")):
-      continue
-    mt = segment_mtime(seg_dir)
-    if mt:
-      date = time.strftime("%Y-%m-%d", time.localtime(mt))
-      counts[date] = counts.get(date, 0) + 1
-  return counts
-
-
-def delete_segments(seg_dirs: list) -> tuple:
-  """Delete segment directories under the log root. Returns (deleted, errors)."""
-  root = os.path.realpath(Paths.log_root())
-  deleted = 0
-  errors = 0
-  for seg_dir in seg_dirs:
-    real = os.path.realpath(seg_dir)
-    if not real.startswith(root + os.sep) or "--" not in os.path.basename(real) or not os.path.isdir(real):
-      errors += 1
-      continue
-    if os.path.exists(os.path.join(real, "rlog.lock")):
-      errors += 1
-      continue
-    try:
-      shutil.rmtree(real)
-      deleted += 1
-    except OSError:
-      errors += 1
-  return deleted, errors
 
 
 def _remux_one(src: str, dst: str) -> tuple:

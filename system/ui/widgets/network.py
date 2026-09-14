@@ -100,6 +100,11 @@ class NetworkUI(Widget):
 
   def _set_panel(self, panel: PanelType):
     self._current_panel = panel
+    # Re-show the panel being opened so its scroller resets to the top
+    if panel == PanelType.WIFI:
+      self._wifi_panel.show_event()
+    elif panel == PanelType.CELLULAR:
+      self._cellular_panel.show_event()
 
   def _render(self, _):
     if self._current_panel == PanelType.SELECT:
@@ -148,6 +153,8 @@ class WifiPanel(Widget):
 
   def _toggle_view(self):
     self._show_settings = not self._show_settings
+    # Start the panel being opened at the top
+    (self._settings_panel if self._show_settings else self._wifi_panel).show_event()
 
   def _render(self, rect: rl.Rectangle):
     if self._show_settings:
@@ -269,6 +276,11 @@ class CellularSettings(Widget):
     self._keyboard.set_callback(update_apn)
     gui_app.push_widget(self._keyboard)
 
+  def show_event(self):
+    super().show_event()
+    # Always open the panel scrolled to the top
+    self._scroller.show_event()
+
   def _update_state(self):
     now = time.monotonic()
     if now - self._last_read > 0.5:
@@ -308,6 +320,10 @@ class WifiAdvancedSettings(Widget):
     self._tethering_action = ToggleAction(initial_state=False)
     tethering_btn = ListItem(lambda: tr("Enable Tethering"), action_item=self._tethering_action, callback=self._toggle_tethering)
 
+    # SSID currently broadcast by the hotspot, shown only while tethering is active
+    self._tethering_ssid_item = text_item(lambda: tr("Tethering SSID"), lambda: self._wifi_manager.tethering_ssid)
+    self._tethering_ssid_item.set_visible(False)
+
     # Edit tethering password
     self._tethering_password_action = ButtonAction(lambda: tr("EDIT"))
     tethering_password_btn = ListItem(lambda: tr("Tethering Password"), action_item=self._tethering_password_action, callback=self._edit_tethering_password)
@@ -320,6 +336,7 @@ class WifiAdvancedSettings(Widget):
 
     items: list[Widget] = [
       tethering_btn,
+      self._tethering_ssid_item,
       tethering_password_btn,
       text_item(lambda: tr("IP Address"), lambda: self._wifi_manager.ipv4_address),
       wifi_metered_btn,
@@ -399,8 +416,14 @@ class WifiAdvancedSettings(Widget):
     self._keyboard.set_callback(update_password)
     gui_app.push_widget(self._keyboard)
 
+  def show_event(self):
+    super().show_event()
+    # Always open the panel scrolled to the top
+    self._scroller.show_event()
+
   def _update_state(self):
     self._wifi_manager.process_callbacks()
+    self._tethering_ssid_item.set_visible(self._wifi_manager.is_tethering_active())
     show_cell_settings = self._prime_state.get_type() in self._cell_prime_types
     self._wifi_manager.set_ipv4_forward(show_cell_settings)
 
@@ -434,6 +457,8 @@ class WifiManagerUI(Widget):
     super().show_event()
     # start/stop scanning when widget is visible
     self._wifi_manager.set_active(True)
+    # Always open the network list scrolled to the top
+    self.scroll_panel.set_offset(0)
 
   def hide_event(self):
     super().hide_event()

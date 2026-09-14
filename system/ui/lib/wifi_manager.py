@@ -302,6 +302,10 @@ class WifiManager:
   def tethering_password(self) -> str:
     return self._tethering_password
 
+  @property
+  def tethering_ssid(self) -> str:
+    return self._tethering_ssid
+
   def _set_connecting(self, ssid: str | None):
     # Called by user action, or sequentially from state change handler
     self._user_epoch += 1
